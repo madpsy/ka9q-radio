@@ -480,7 +480,8 @@ int loadconfig(char const *file){
 		addr != 0 ? &slen : NULL);
   }
   // either resolve_mcast() or avahi_start() has resolved the target DNS name into Frontend.metadata_dest_socket and inserted the port number
-  join_group(Output_fd,NULL,&Frontend.metadata_dest_socket,Iface);
+  // Note: Output_fd should NOT be joined to the status group - it's for data only
+  // The Ctl_fd socket (created below) handles the status/control group
   // Same remote socket as status
   Ctl_fd = listen_mcast(NULL,&Frontend.metadata_dest_socket,Iface);
   if(Ctl_fd < 0){

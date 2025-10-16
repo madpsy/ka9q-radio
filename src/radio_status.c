@@ -117,16 +117,14 @@ static int send_radio_status_ex(struct sockaddr const *sock,struct frontend cons
   uint8_t packet[PKTSIZE];
   chan->status.packets_out++;
   int const len = encode_radio_status_ex(frontend,chan,packet,sizeof(packet),skip_spectrum_poll);
-  // I had been forcing metadata to the ttl != 0 socket even when ttl = 0, but this creates a potential problem when
-  // 1. Multiple radiod are running on the same system;
-  // 2. The same SSRC is in use by more than one radiod;
-  // 3. A consumer (monitor, pcmrecord) uses the source port as part of the session identifier (monitor currently does not, pcmrecord does)
-  // 4. TTL is 0, so metadata is forced over the ttl != 0 socket
-  //    and stream data is sent over the ttl==0 socket
-  //    Then the status/data source ports may not match and the consume may think they're separate streams
-  int const out_fd = (chan->output.ttl > 0) ? Output_fd : Output_fd0;
-  if(sendto(out_fd,packet,len,0,sock,sizeof(struct sockaddr)) < 0)
+  // Status responses should be sent on the control/status socket (Ctl_fd), not the data output socket
+  // Using the data socket (Output_fd) causes failures in strict networking environments like Docker
+  // because Output_fd is bound to the data multicast group, not the status multicast group
+  if(sendto(Ctl_fd,packet,len,0,sock,sizeof(struct sockaddr)) < 0){
     chan->output.errors++;
+    if(Verbose > 1)
+      fprintf(stderr,"sendto status failed for ssrc %u: %s\n",chan->output.rtp.ssrc,strerror(errno));
+  }
 
   return 0;
 }
@@ -537,11 +535,11 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
       break;
     case OUTPUT_DATA_DEST_SOCKET:
       {
-	// Actually sets both data and status, overriding port numbers
-	decode_socket(&chan->output.dest_socket,cp,optlen);
-	setport(&chan->output.dest_socket,DEFAULT_RTP_PORT);
-	chan->status.dest_socket = chan->output.dest_socket;
-	setport(&chan->status.dest_socket,DEFAULT_STAT_PORT);
+ // Actually sets both data and status, overriding port numbers
+ decode_socket(&chan->output.dest_socket,cp,optlen);
+ setport(&chan->output.dest_socket,DEFAULT_RTP_PORT);
+ chan->status.dest_socket = chan->output.dest_socket;
+ setport(&chan->status.dest_socket,DEFAULT_STAT_PORT);
       }
       break;
     default:
