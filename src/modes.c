@@ -281,6 +281,9 @@ int loadpreset(struct channel *chan,dictionary const *table,char const *sname){
     chan->filter.min_IF = chan->filter.max_IF;
     chan->filter.max_IF = t;
   }
+  fprintf(stderr,"loadpreset: '%s' samprate=%d, low=%.0f, high=%.0f, channels=%d, filter2=%d, agc=%s\n",
+          sname, chan->output.samprate, chan->filter.min_IF, chan->filter.max_IF,
+          chan->output.channels, chan->filter2.blocking, chan->linear.agc ? "yes" : "no");
   {
     char const *cp = config_getstring(table,sname,"squelch-open",NULL);
     if(cp)
