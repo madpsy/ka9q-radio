@@ -1505,6 +1505,12 @@ int set_channel_filter(struct channel *chan){
   float lower = max(chan->filter.min_IF, -(float)chan->output.samprate/2);
   float upper = min(chan->filter.max_IF, (float)chan->output.samprate/2);
 
+  fprintf(stderr,"set_channel_filter: ssrc=%u, requested IF=[%.0f,%.0f], samprate=%d, Nyquist=%.0f\n",
+          chan->output.rtp.ssrc, chan->filter.min_IF, chan->filter.max_IF,
+          chan->output.samprate, (float)chan->output.samprate/2);
+  fprintf(stderr,"set_channel_filter: ssrc=%u, ACTUAL filter IF=[%.0f,%.0f] (after Nyquist limiting)\n",
+          chan->output.rtp.ssrc, lower, upper);
+
   if(Verbose > 1)
     fprintf(stderr,"new filter for chan %'u: IF=[%'.0f,%'.0f], samprate %'d, kaiser beta %.1f\n",
 	    chan->output.rtp.ssrc, lower, upper,
