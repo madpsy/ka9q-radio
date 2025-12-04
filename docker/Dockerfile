@@ -199,7 +199,24 @@ fi\n\
 # Also enable on loopback for local communication\n\
 ip link set lo multicast on || true\n\
 \n\
-# Start radiod\n\
+# Create restart trigger directory\n\
+mkdir -p /var/run/restart-trigger\n\
+\n\
+# Start background watcher for restart trigger file\n\
+# When trigger file is detected, kill PID 1 (radiod) to trigger container restart\n\
+(\n\
+    while true; do\n\
+        if [ -f /var/run/restart-trigger/restart ]; then\n\
+            echo "Restart trigger detected, killing PID 1 to restart container..."\n\
+            rm -f /var/run/restart-trigger/restart\n\
+            kill -TERM 1\n\
+            exit 0\n\
+        fi\n\
+        sleep 0.5\n\
+    done\n\
+) &\n\
+\n\
+# Start radiod as PID 1\n\
 exec /usr/local/sbin/radiod "$@"\n\
 ' > /usr/local/bin/start-radiod.sh && \
     chmod +x /usr/local/bin/start-radiod.sh
