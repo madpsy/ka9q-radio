@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <errno.h>
+#include <arpa/inet.h>
 
 #include "misc.h"
 #include "radio.h"
@@ -32,9 +33,11 @@
 #include "status.h"
 
 extern dictionary const *Preset_table;
+
 static int encode_radio_status(struct frontend const *frontend,struct channel *chan,uint8_t *packet, int len);
 static int encode_radio_status_ex(struct frontend const *frontend,struct channel *chan,uint8_t *packet, int len, bool skip_spectrum_poll);
 static int send_radio_status_ex(struct sockaddr const *sock,struct frontend const *frontend,struct channel *chan,bool skip_spectrum_poll);
+static bool decode_radio_commands_with_source(struct channel *chan,uint8_t const *buffer,int length,char const *source_ip);
 
 // Radio status reception and transmission thread
 void *radio_status(void *arg){
@@ -44,9 +47,21 @@ void *radio_status(void *arg){
   while(true){
     // Command from user
     uint8_t buffer[PKTSIZE];
-    int const length = recv(Ctl_fd,buffer,sizeof(buffer),0);
+    struct sockaddr_storage sender_addr;
+    socklen_t addr_len = sizeof(sender_addr);
+    int const length = recvfrom(Ctl_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&sender_addr,&addr_len);
     if(length <= 0 || (enum pkt_type)buffer[0] != CMD)
       continue; // short packet, or a response; ignore
+
+    // Get sender IP address for logging
+    char sender_ip[INET6_ADDRSTRLEN] = "unknown";
+    if(sender_addr.ss_family == AF_INET){
+      struct sockaddr_in *s = (struct sockaddr_in *)&sender_addr;
+      inet_ntop(AF_INET, &s->sin_addr, sender_ip, sizeof(sender_ip));
+    } else if(sender_addr.ss_family == AF_INET6){
+      struct sockaddr_in6 *s = (struct sockaddr_in6 *)&sender_addr;
+      inet_ntop(AF_INET6, &s->sin6_addr, sender_ip, sizeof(sender_ip));
+    }
 
     // for a specific ssrc?
     uint32_t ssrc = get_ssrc(buffer+1,length-1);
@@ -66,39 +81,39 @@ void *radio_status(void *arg){
       break;
     default:
       {
-	// find specific chan instance
-	struct channel *chan = lookup_chan(ssrc);
-	if(chan != NULL){
-	  // Channel already exists; queue the command for it to execute
-	  uint8_t *cmd = malloc(length-1);
-	  assert(cmd != NULL);
-	  memcpy(cmd,buffer+1,length-1);
-	  pthread_mutex_lock(&chan->status.lock);
-	  bool oops = false;
-	  if(chan->status.command){
-	    // An entry already exists. Drop ours, until we make this a queue
-	    oops = true;
-	  } else {
-	    chan->status.command = cmd;
-	    chan->status.length = length-1;
-	  }
-	  pthread_mutex_unlock(&chan->status.lock);
-	  if(oops)
-	    FREE(cmd);
-	} else {
+ // find specific chan instance
+ struct channel *chan = lookup_chan(ssrc);
+ if(chan != NULL){
+   // Channel already exists; queue the command for it to execute
+   uint8_t *cmd = malloc(length-1);
+   assert(cmd != NULL);
+   memcpy(cmd,buffer+1,length-1);
+   pthread_mutex_lock(&chan->status.lock);
+   bool oops = false;
+   if(chan->status.command){
+     // An entry already exists. Drop ours, until we make this a queue
+     oops = true;
+   } else {
+     chan->status.command = cmd;
+     chan->status.length = length-1;
+   }
+   pthread_mutex_unlock(&chan->status.lock);
+   if(oops)
+     FREE(cmd);
+ } else {
 	  // Channel doesn't yet exist. Create, execute the rest of this command here, and then start the new demod
 	  if((chan = create_chan(ssrc)) == NULL){ // possible race here?
 	    // Creation failed, e.g., no output stream
 	    fprintf(stderr,"Dynamic create of ssrc %'u failed; is 'data =' set in [global]?\n",ssrc);
 	  } else {
 	    chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding); // make sure it's initialized
-	    bool spectrum_changed = decode_radio_commands(chan,buffer+1,length-1);
+	    bool spectrum_changed = decode_radio_commands_with_source(chan,buffer+1,length-1,sender_ip);
 	    send_radio_status_ex(&chan->frontend->metadata_dest_socket,chan->frontend,chan,spectrum_changed); // Send status in response
 	    reset_radio_status(chan);
 	    chan->status.global_timer = 0; // Just sent one
 	    start_demod(chan);
 	    if(Verbose)
-	      fprintf(stderr,"dynamically started ssrc %'u\n",ssrc);
+	      fprintf(stderr,"dynamically started ssrc %'u from %s\n",ssrc,sender_ip);
 	  }
 	}
       }
@@ -138,15 +153,30 @@ int reset_radio_status(struct channel *chan){
   return 0;
 }
 
+// Wrapper for backward compatibility
+bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length){
+  return decode_radio_commands_with_source(chan,buffer,length,"unknown");
+}
+
 // Return TRUE if a restart is needed, FALSE if spectrum params changed (for SPECT_DEMOD)
 // Actually returns: restart_needed for non-spectrum, spectrum_params_changed for spectrum
-bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length){
+// source_ip parameter added for debugging orphaned channels
+static bool decode_radio_commands_with_source(struct channel *chan,uint8_t const *buffer,int length,char const *source_ip){
   bool restart_needed = false;
   bool new_filter_needed = false;
   uint32_t const ssrc = chan->output.rtp.ssrc;
 
-  if(chan->lifetime != 0)
+  // Log when lifetime is reset for channels at freq=0 (helps debug orphaned channels)
+  // Always log this regardless of Verbose setting since it indicates a potential issue
+  // CRITICAL FIX: Do NOT reset lifetime for channels already at freq=0
+  // This allows orphaned channels to actually expire instead of being kept alive by polls
+  if(chan->lifetime != 0 && chan->tune.freq != 0){
     chan->lifetime = Channel_idle_timeout; // restart self-destruct timer
+  } else if(chan->lifetime != 0 && chan->tune.freq == 0){
+    // Channel is at freq=0, let it expire - don't reset lifetime
+    fprintf(stderr,"INFO: Command received for idle channel (freq=0): ssrc %u from %s, lifetime NOT reset (will expire in %d blocks)\n",
+            ssrc, source_ip, chan->lifetime);
+  }
   chan->status.packets_in++;
 
   // Save parameters that should override preset defaults

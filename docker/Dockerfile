@@ -202,14 +202,20 @@ ip link set lo multicast on || true\n\
 # Create restart trigger directory\n\
 mkdir -p /var/run/restart-trigger\n\
 \n\
+# Record our startup time and signal ubersdr\n\
+RADIOD_START_TIME=$(date +%s)\n\
+echo "$RADIOD_START_TIME" > /var/run/restart-trigger/radiod-startup-time\n\
+touch /var/run/restart-trigger/restart-ubersdr\n\
+echo "Radiod started at $RADIOD_START_TIME, signaling ubersdr"\n\
+\n\
 # Start background watcher for restart trigger file\n\
 # When trigger file is detected, kill PID 1 (radiod) to trigger container restart\n\
 (\n\
     while true; do\n\
         if [ -f /var/run/restart-trigger/restart ]; then\n\
-            echo "Restart trigger detected, killing PID 1 to restart container..."\n\
+            echo "Restart trigger detected from ubersdr, restarting..."\n\
             rm -f /var/run/restart-trigger/restart\n\
-            kill -TERM 1\n\
+            kill -TERM 1 || kill -KILL 1\n\
             exit 0\n\
         fi\n\
         sleep 0.5\n\

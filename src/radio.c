@@ -1352,18 +1352,8 @@ int downconvert(struct channel *chan){
   double remainder = 0;
 
   while(true){
-    // Should we die?
-    // Will be slower if 0 Hz is outside front end coverage because of slow timed wait below
-    // But at least it will eventually go away
-    if(chan->tune.freq == 0 && chan->lifetime > 0){
-      if(--chan->lifetime <= 0){
-	chan->demod_type = -1;  // No demodulator
-	if(Verbose > 1)
-	  fprintf(stderr,"chan %d terminate needed\n",chan->output.rtp.ssrc);
-	return -1; // terminate needed
-      }
-    }
-    // Process any commands and return status
+    // Process any commands and return status FIRST
+    // This ensures commands (including termination) are processed even if freq=0
     bool restart_needed = false;
     pthread_mutex_lock(&chan->status.lock);
 
@@ -1377,9 +1367,9 @@ int downconvert(struct channel *chan){
       chan->status.global_timer = 0; // Just sent one
       // Also send to output stream
       if(chan->demod_type != SPECT_DEMOD){
-	// Only send spectrum on status channel, and only in response to poll
-	// Spectrum channel output socket isn't set anyway
-	send_radio_status(&chan->status.dest_socket,&Frontend,chan);
+ // Only send spectrum on status channel, and only in response to poll
+ // Spectrum channel output socket isn't set anyway
+ send_radio_status(&chan->status.dest_socket,&Frontend,chan);
       }
       chan->status.output_timer = chan->status.output_interval; // Reload
       FREE(chan->status.command);
@@ -1392,20 +1382,33 @@ int downconvert(struct channel *chan){
     } else if(chan->status.output_interval != 0 && chan->status.output_timer > 0){
       // Timer is running for status on output stream
       if(--chan->status.output_timer == 0){
-	// Timer has expired; send status on output channel
-	send_radio_status(&chan->status.dest_socket,&Frontend,chan);
-	reset_radio_status(chan);
-	if(!chan->output.silent)
-	  chan->status.output_timer = chan->status.output_interval; // Restart timer only if channel is active
+ // Timer has expired; send status on output channel
+ send_radio_status(&chan->status.dest_socket,&Frontend,chan);
+ reset_radio_status(chan);
+ if(!chan->output.silent)
+   chan->status.output_timer = chan->status.output_interval; // Restart timer only if channel is active
       }
     }
 
     pthread_mutex_unlock(&chan->status.lock);
     if(restart_needed){
       if(Verbose > 1)
-	fprintf(stderr,"chan %d restart needed\n",chan->output.rtp.ssrc);
+ fprintf(stderr,"chan %d restart needed\n",chan->output.rtp.ssrc);
       return +1; // Restart needed
     }
+    
+    // Should we die?
+    // Check this AFTER processing commands so termination commands are handled
+    // Will be slower if 0 Hz is outside front end coverage because of slow timed wait below
+    // But at least it will eventually go away
+    if(chan->tune.freq == 0 && chan->lifetime > 0){
+      if(--chan->lifetime <= 0){
+ chan->demod_type = -1;  // No demodulator
+ fprintf(stderr,"INFO: Channel %u (freq=0) lifetime expired, terminating\n",chan->output.rtp.ssrc);
+ return -1; // terminate needed
+      }
+    }
+    
     // To save CPU time when the front end is completely tuned away from us, block (with timeout) until the front
     // end status changes rather than process zeroes. We must still poll the terminate flag.
     pthread_mutex_lock(&Frontend.status_mutex);
