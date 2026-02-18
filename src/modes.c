@@ -286,13 +286,26 @@ int loadpreset(struct channel *chan,dictionary const *table,char const *sname){
           chan->output.channels, chan->filter2.blocking, chan->linear.agc ? "yes" : "no");
   {
     char const *cp = config_getstring(table,sname,"squelch-open",NULL);
-    if(cp)
-      chan->squelch_open = dB2power(strtof(cp,NULL));
+    if(cp){
+      float val = strtof(cp,NULL);
+      // Special value -999 means "always open" - use a very small positive value
+      // that will always be less than any valid SNR (which is clamped to >= 0)
+      if(val <= -999.0f)
+        chan->squelch_open = 0.0f; // Will be handled specially in fm.c
+      else
+        chan->squelch_open = dB2power(val);
+    }
   }
   {
     char const *cp = config_getstring(table,sname,"squelch-close",NULL);
-    if(cp)
-      chan->squelch_close = dB2power(strtof(cp,NULL));
+    if(cp){
+      float val = strtof(cp,NULL);
+      // Special value -999 means "always open"
+      if(val <= -999.0f)
+        chan->squelch_close = 0.0f; // Will be handled specially in fm.c
+      else
+        chan->squelch_close = dB2power(val);
+    }
   }
   chan->squelch_tail = config_getint(table,sname,"squelchtail",chan->squelch_tail); // historical
   chan->squelch_tail = config_getint(table,sname,"squelch-tail",chan->squelch_tail);

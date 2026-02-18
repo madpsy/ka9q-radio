@@ -133,7 +133,10 @@ int demod_wfm(void *arg){
 
     // Hysteresis
     int const squelch_state_max = chan->squelch_tail + 1;
-    if(chan->fm.snr >= chan->squelch_open
+    // If squelch is set to "always open" (both thresholds = 0.0 from -999), bypass squelch logic
+    // Check dynamically so runtime updates work
+    if((chan->squelch_open == 0.0f && chan->squelch_close == 0.0f)
+       || chan->fm.snr >= chan->squelch_open
        || (squelch_state > 0 && snr >= chan->squelch_close))
       // Squelch is fully open
       // tail timing is in blocks (usually 10 or 20 ms each)

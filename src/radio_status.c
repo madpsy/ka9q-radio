@@ -458,16 +458,26 @@ static bool decode_radio_commands_with_source(struct channel *chan,uint8_t const
       break;
     case SQUELCH_OPEN:
       {
-	float const x = decode_float(cp,optlen);
-	if(isfinite(x))
-	  chan->squelch_open = fabsf(dB2power(x));
+ float const x = decode_float(cp,optlen);
+ if(isfinite(x)){
+   // Special value -999 or less means "always open" - use 0.0 as marker
+   if(x <= -999.0f)
+     chan->squelch_open = 0.0f;
+   else
+     chan->squelch_open = fabsf(dB2power(x));
+ }
       }
       break;
     case SQUELCH_CLOSE:
       {
-	float const x = decode_float(cp,optlen);
-	if(isfinite(x))
-	   chan->squelch_close = fabsf(dB2power(x));
+ float const x = decode_float(cp,optlen);
+ if(isfinite(x)){
+   // Special value -999 or less means "always open" - use 0.0 as marker
+   if(x <= -999.0f)
+     chan->squelch_close = 0.0f;
+   else
+     chan->squelch_close = fabsf(dB2power(x));
+ }
       }
       break;
     case NONCOHERENT_BIN_BW:
