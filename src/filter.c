@@ -76,6 +76,12 @@ struct fft_job {
 
 static struct fft_job *FFT_free_list; // List of spare job descriptors
 
+// Global list of all filter_in instances for statistics logging
+static pthread_mutex_t Filter_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct filter_in *Filter_list_head = NULL;
+static pthread_t Stats_thread;
+static bool Stats_thread_running = false;
+
 #define NTHREADS_MAX 20  // More than I'll ever need
 static struct {
   pthread_mutex_t queue_mutex; // protects job_queue
@@ -151,6 +157,68 @@ fftwf_plan plan_c2r(int N, float complex *in, float *out){
   return plan;
 }
 
+
+// Statistics logging thread - logs filter signaling stats every minute
+static void *filter_stats_thread(void *arg){
+  (void)arg; // Unused
+
+  while(true){
+    sleep(60); // Log every minute
+
+    pthread_mutex_lock(&Filter_list_mutex);
+
+    unsigned long long total_targeted = 0;
+    unsigned long long total_broadcast = 0;
+    int filter_count = 0;
+    int total_slaves = 0;
+
+    for(struct filter_in *f = Filter_list_head; f != NULL; f = f->next_filter){
+      filter_count++;
+
+      // Count slaves for this filter
+      int slave_count = 0;
+      pthread_mutex_lock(&f->filter_mutex);
+      for(struct filter_out *slave = f->slave_list_head; slave != NULL; slave = slave->next_slave){
+        slave_count++;
+      }
+      total_slaves += slave_count;
+
+      // Update peak slave count if current count is higher
+      if(slave_count > f->peak_slave_count){
+        f->peak_slave_count = slave_count;
+      }
+
+      total_targeted += f->targeted_signals;
+      total_broadcast += f->broadcast_signals;
+      pthread_mutex_unlock(&f->filter_mutex);
+    }
+
+    pthread_mutex_unlock(&Filter_list_mutex);
+
+    if(filter_count > 0 && total_broadcast > 0){
+      // Calculate average slaves signaled per FFT
+      double avg_slaves_per_fft = (double)total_targeted / total_broadcast;
+
+      // Calculate efficiency based on peak slave count seen
+      // This handles dynamic slave counts correctly
+      int peak_slaves = 0;
+      pthread_mutex_lock(&Filter_list_mutex);
+      for(struct filter_in *f = Filter_list_head; f != NULL; f = f->next_filter){
+        if(f->peak_slave_count > peak_slaves){
+          peak_slaves = f->peak_slave_count;
+        }
+      }
+      pthread_mutex_unlock(&Filter_list_mutex);
+
+      double efficiency = peak_slaves > 0 ? (100.0 * avg_slaves_per_fft / peak_slaves) : 0.0;
+
+      fprintf(stderr,"[Filter Stats] filters=%d slaves=%d peak_slaves=%d targeted_signals=%llu broadcast_signals=%llu avg_per_fft=%.1f efficiency=%.1f%%\n",
+              filter_count, total_slaves, peak_slaves, total_targeted, total_broadcast, avg_slaves_per_fft, efficiency);
+    }
+  }
+
+  return NULL;
+}
 
 // Create fast convolution filters
 // The filters are now in two parts, filter_in (the master) and filter_out (the slave)
@@ -276,6 +344,18 @@ int create_filter_input(struct filter_in *master,int const L,int const M, enum f
     break;
   }
   realtime(old_prio);
+
+  // Register this filter in the global list for statistics logging
+  pthread_mutex_lock(&Filter_list_mutex);
+  master->next_filter = Filter_list_head;
+  Filter_list_head = master;
+
+  // Start the statistics logging thread if not already running
+  if(!Stats_thread_running){
+    Stats_thread_running = true;
+    pthread_create(&Stats_thread, NULL, filter_stats_thread, NULL);
+  }
+  pthread_mutex_unlock(&Filter_list_mutex);
 
   return 0;
 }
@@ -410,6 +490,21 @@ int create_filter_output(struct filter_out *slave,struct filter_in * master,floa
     }
   }
   slave->next_jobnum = master->next_jobnum;
+
+  // Initialize per-slave condition variable to eliminate thundering herd
+  pthread_cond_init(&slave->slave_cond, NULL);
+
+  // Register this slave in the master's linked list
+  // This allows targeted signaling when FFT jobs complete
+  pthread_mutex_lock(&master->filter_mutex);
+  slave->next_slave = master->slave_list_head;
+  slave->prev_slave = NULL;
+  if (master->slave_list_head != NULL) {
+    master->slave_list_head->prev_slave = slave;
+  }
+  master->slave_list_head = slave;
+  pthread_mutex_unlock(&master->filter_mutex);
+
   return 0;
 }
 // Assist with choosing good blocksizes for FFTW3
@@ -525,8 +620,25 @@ void *run_fft(void *p){
       pthread_mutex_lock(job->completion_mutex);
     if(job->completion_jobnum)
       *job->completion_jobnum = job->jobnum;
-    if(job->completion_cond)
+
+    // NEW: Signal only slaves waiting for THIS specific job (targeted wakeup)
+    if(job->fin != NULL) {
+      int targeted_count = 0;
+      for (struct filter_out *slave = job->fin->slave_list_head; slave != NULL; slave = slave->next_slave) {
+        if (slave->next_jobnum == job->jobnum) {
+          pthread_cond_signal(&slave->slave_cond);
+          targeted_count++;
+        }
+      }
+      job->fin->targeted_signals += targeted_count;
+    }
+
+    // Keep old broadcast for backward compatibility during transition
+    if(job->completion_cond) {
       pthread_cond_broadcast(job->completion_cond);
+      if(job->fin != NULL)
+        job->fin->broadcast_signals++;
+    }
     if(job->completion_mutex)
       pthread_mutex_unlock(job->completion_mutex);
     // Do NOT destroy job->completion_cond and completion_mutex here, they continue to exist
@@ -584,7 +696,22 @@ int execute_filter_input(struct filter_in * const f){
     // Signal we're done with this job
     pthread_mutex_lock(&f->filter_mutex);
     f->completed_jobs[jobnum % ND] = jobnum;
+
+    // NEW: Signal only slaves waiting for THIS specific job
+    // This eliminates the thundering herd problem
+    int targeted_count = 0;
+    for (struct filter_out *slave = f->slave_list_head; slave != NULL; slave = slave->next_slave) {
+      if (slave->next_jobnum == jobnum) {
+        pthread_cond_signal(&slave->slave_cond);
+        targeted_count++;
+      }
+    }
+    f->targeted_signals += targeted_count;
+
+    // Keep old broadcast for backward compatibility during transition
     pthread_cond_broadcast(&f->filter_cond);
+    f->broadcast_signals++;
+
     pthread_mutex_unlock(&f->filter_mutex);
     return 0;
   }
@@ -700,8 +827,10 @@ int execute_filter_output(struct filter_out * const slave,int const shift){
     slave->block_drops += nextblock - slave->next_jobnum;
     slave->next_jobnum = nextblock;
   }
+  // NEW: Wait on per-slave condition variable to eliminate thundering herd
+  // Each slave now only wakes when its specific job is ready
   while((int)(slave->next_jobnum - master->completed_jobs[slave->next_jobnum % ND]) > 0)
-    pthread_cond_wait(&master->filter_cond,&master->filter_mutex);
+    pthread_cond_wait(&slave->slave_cond,&master->filter_mutex);
   // We don't modify the master's output data, we create our own
   float complex const * const fdomain = master->fdomain[slave->next_jobnum % ND];
   // in case we just waited so long that the buffer wrapped, resynch
@@ -980,6 +1109,30 @@ int delete_filter_input(struct filter_in * master){
 int delete_filter_output(struct filter_out *slave){
   if(slave == NULL)
     return -1;
+
+  // Deregister this slave from the master's linked list
+  // This must be done before destroying the condition variable
+  struct filter_in *master = slave->master;
+  if (master != NULL) {
+    pthread_mutex_lock(&master->filter_mutex);
+
+    // Remove from doubly-linked list
+    if (slave->prev_slave != NULL) {
+      slave->prev_slave->next_slave = slave->next_slave;
+    } else {
+      // This slave was the head of the list
+      master->slave_list_head = slave->next_slave;
+    }
+
+    if (slave->next_slave != NULL) {
+      slave->next_slave->prev_slave = slave->prev_slave;
+    }
+
+    pthread_mutex_unlock(&master->filter_mutex);
+  }
+
+  // Destroy the per-slave condition variable
+  pthread_cond_destroy(&slave->slave_cond);
 
   ASSERT_UNLOCKED(&slave->response_mutex);
   pthread_mutex_destroy(&slave->response_mutex);

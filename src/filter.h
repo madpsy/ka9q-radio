@@ -61,7 +61,15 @@ struct filter_in {
   fftwf_plan fwd_plan;               // FFT (time -> frequency)
 
   pthread_mutex_t filter_mutex;      // Synchronization for sequence number
-  pthread_cond_t filter_cond;
+  pthread_cond_t filter_cond;        // DEPRECATED: kept for compatibility, will be removed
+
+  struct filter_out *slave_list_head; // Linked list of all slaves waiting on this master
+
+  // Statistics for thundering herd fix monitoring
+  unsigned long long targeted_signals;   // Count of targeted signals sent
+  unsigned long long broadcast_signals;  // Count of broadcast signals sent (for comparison)
+  int peak_slave_count;                  // Peak number of slaves seen (for efficiency calculation)
+  struct filter_in *next_filter;         // Next filter in global list (for stats logging)
 
   struct notch_state *notches;
   float complex *fdomain[ND];
@@ -87,6 +95,11 @@ struct filter_out {
   unsigned next_jobnum;
   unsigned block_drops;          // Lost frequency domain blocks, e.g., from late scheduling of slave thread
   int rcnt;                 // Samples read from output buffer
+
+  // Per-slave synchronization to eliminate thundering herd
+  pthread_cond_t slave_cond;         // This slave's private condition variable
+  struct filter_out *next_slave;     // Next slave in master's linked list
+  struct filter_out *prev_slave;     // Previous slave in master's linked list (for easy removal)
 };
 
 int create_filter_input(struct filter_in *,int const L,int const M, enum filtertype const in_type);
