@@ -1,0 +1,3 @@
+FROM madpsy/ka9q-radio:latest
+RUN apt-get update && apt-get install -y strace && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/bin/bash"]
