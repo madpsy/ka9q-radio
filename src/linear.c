@@ -274,13 +274,14 @@ int demod_linear(void *arg){
 
     if(chan->snr_squelch_enable || chan->pll.enable){
       if(squelch_open && snr < chan->squelch_close)
-	squelch_open = false;
+ squelch_open = false;
       else if(!squelch_open && snr > chan->squelch_open){
-	squelch_open = true;
-	am_dc = 0; // try to remove the opening thump caused by the carrier
+ squelch_open = true;
+ am_dc = 0; // try to remove the opening thump caused by the carrier
       }
+    } else {
+      squelch_open = true;  // No squelch configured; always pass audio
     }
-    // otherwise leave it be
 
     // Mute if no signal (e.g., outside front end coverage)
     // or if zero frequency
