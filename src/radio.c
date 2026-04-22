@@ -60,7 +60,7 @@ static int const DEFAULT_UPDATE = 25; // 2 Hz for 20 ms blocktime (50 Hz frame r
 static int Update = DEFAULT_UPDATE;
 static int const DEFAULT_FFTW_THREADS = 1;
 static int const DEFAULT_FFTW_INTERNAL_THREADS = 1;
-static int const DEFAULT_LIFETIME = 20; // 20 sec for idle sessions tuned to 0 Hz
+static int const DEFAULT_LIFETIME = 5; // 5 sec for idle sessions tuned to 0 Hz
 static int const DEFAULT_OVERLAP = 5;
 static double const Power_alpha = 0.10; // Noise estimation time smoothing factor, per block. Use double to reduce risk of slow denormals
 static float const NQ = 0.10f; // look for energy in 10th quartile, hopefully contains only noise
@@ -273,7 +273,7 @@ int loadconfig(char const *file){
   Description = config_getstring(Configtable,GLOBAL,"description",NULL);
   Verbose = config_getint(Configtable,GLOBAL,"verbose",Verbose);
   Blocktime = fabs(config_getdouble(Configtable,GLOBAL,"blocktime",Blocktime));
-  Channel_idle_timeout = 20 * 1000 / Blocktime;
+  Channel_idle_timeout = DEFAULT_LIFETIME * 1000 / Blocktime;
   Overlap = abs(config_getint(Configtable,GLOBAL,"overlap",Overlap));
   N_worker_threads = config_getint(Configtable,GLOBAL,"fft-threads",DEFAULT_FFTW_THREADS); // variable owned by filter.c
   N_internal_threads = config_getint(Configtable,GLOBAL,"fft-internal-threads",DEFAULT_FFTW_INTERNAL_THREADS); // owned by filter.c
@@ -940,7 +940,7 @@ struct channel *create_chan(uint32_t ssrc){
     chan->frontend = &Frontend; // Should be already set in template, but just be sure
     chan->output.rtp.ssrc = ssrc; // Stash it
     Active_channel_count++;
-    chan->lifetime = 20 * 1000 / Blocktime; // If freq == 0, goes away 20 sec after last command
+    chan->lifetime = DEFAULT_LIFETIME * 1000 / Blocktime; // If freq == 0, goes away after last command
   }
   pthread_mutex_unlock(&Channel_list_mutex);
   return chan;
@@ -1017,7 +1017,13 @@ int close_chan(struct channel *chan){
   pthread_mutex_lock(&chan->status.lock);
   FREE(chan->status.command);
   FREE(chan->spectrum.bin_data);
+  FREE(chan->spectrum.power_buffer);
+  chan->spectrum.power_buffer_size = 0;
   delete_filter_output(&chan->filter.out);
+  if(chan->output.queue != NULL){
+    mirror_free((void *)&chan->output.queue, chan->output.queue_size * sizeof(float));
+    chan->output.queue_size = 0;
+  }
   if(chan->output.opus != NULL){
     opus_encoder_destroy(chan->output.opus);
     chan->output.opus = NULL;

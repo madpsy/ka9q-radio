@@ -44,6 +44,8 @@ int demod_linear(void *arg){
   pthread_mutex_lock(&chan->status.lock);
   FREE(chan->status.command);
   FREE(chan->spectrum.bin_data);
+  FREE(chan->spectrum.power_buffer);
+  chan->spectrum.power_buffer_size = 0;
   if(chan->output.opus != NULL){
     opus_encoder_destroy(chan->output.opus);
     chan->output.opus = NULL;

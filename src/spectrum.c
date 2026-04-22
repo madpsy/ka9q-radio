@@ -34,6 +34,8 @@ int demod_spectrum(void *arg){
   pthread_mutex_lock(&chan->status.lock);
   FREE(chan->status.command);
   FREE(chan->spectrum.bin_data);
+  FREE(chan->spectrum.power_buffer);
+  chan->spectrum.power_buffer_size = 0;
   chan->spectrum.allocated_bin_count = 0; // Initialize to safe state
   delete_filter_output(&chan->filter.out);
   delete_filter_output(&chan->filter2.out); // filter2 not used in spectrum mode
@@ -100,6 +102,8 @@ int demod_spectrum(void *arg){
       fft0_in = fft1_in = fft_out = NULL;
       FREE(chan->status.command);
       FREE(chan->spectrum.bin_data);
+      FREE(chan->spectrum.power_buffer);
+      chan->spectrum.power_buffer_size = 0;
       chan->spectrum.allocated_bin_count = 0; // Mark as deallocated
       FREE(kaiser);
 
@@ -148,6 +152,8 @@ int demod_spectrum(void *arg){
 	  delete_filter_output(&chan->filter.out);
 	  FREE(chan->status.command);
 	  FREE(chan->spectrum.bin_data);
+	  FREE(chan->spectrum.power_buffer);
+	  chan->spectrum.power_buffer_size = 0;
 	  return -1;
 	}
 
@@ -239,6 +245,8 @@ int demod_spectrum(void *arg){
   FREE(kaiser);
   FREE(chan->status.command);
   FREE(chan->spectrum.bin_data);
+  FREE(chan->spectrum.power_buffer);
+  chan->spectrum.power_buffer_size = 0;
   return 0;
 }
 
@@ -303,7 +311,19 @@ int spectrum_poll(struct channel *chan){
   // Read the master's frequency bins directly
   // The layout depends on the master's time domain input:
   // 1. Complex 2. Real, upright spectrum 3. Real, inverted spectrum
-  double *power_buffer = malloc((input_bins + 10) * sizeof *power_buffer);
+  // Reuse a persistent scratch buffer to avoid malloc/free on every poll.
+  // Reallocate only when input_bins grows beyond the current allocation.
+  int const needed = input_bins + 10;
+  if(chan->spectrum.power_buffer_size < needed){
+    FREE(chan->spectrum.power_buffer);
+    chan->spectrum.power_buffer = malloc(needed * sizeof(float));
+    if(chan->spectrum.power_buffer == NULL){
+      chan->spectrum.power_buffer_size = 0;
+      return -1;
+    }
+    chan->spectrum.power_buffer_size = needed;
+  }
+  float * const power_buffer = chan->spectrum.power_buffer;
   if(master->in_type == COMPLEX){
     int binp = chan->filter.bin_shift - input_bins/2;
     if(binp < 0)
@@ -447,6 +467,6 @@ int spectrum_poll(struct channel *chan){
       chan->spectrum.bin_data[out++] = (p * gain);
     }
   }
-  FREE(power_buffer);
+  // power_buffer is now persistent; do not free here
   return 0;
 }

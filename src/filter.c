@@ -69,7 +69,6 @@ struct fft_job {
   struct filter_in *fin;
   size_t input_dropsize;      // byte counts to drop from cache when FFT finishes
   pthread_mutex_t *completion_mutex; // protects completion_jobnum
-  pthread_cond_t *completion_cond;   // Signaled when job is complete
   unsigned int *completion_jobnum;   // Written with jobnum when complete
   bool terminate; // set to tell fft thread to quit
 };
@@ -633,15 +632,8 @@ void *run_fft(void *p){
       job->fin->targeted_signals += targeted_count;
     }
 
-    // Keep old broadcast for backward compatibility during transition
-    if(job->completion_cond) {
-      pthread_cond_broadcast(job->completion_cond);
-      if(job->fin != NULL)
-        job->fin->broadcast_signals++;
-    }
     if(job->completion_mutex)
       pthread_mutex_unlock(job->completion_mutex);
-    // Do NOT destroy job->completion_cond and completion_mutex here, they continue to exist
 
     bool const terminate = job->terminate; // Don't use job pointer after free
     // Put descriptor on free pool
@@ -708,10 +700,6 @@ int execute_filter_input(struct filter_in * const f){
     }
     f->targeted_signals += targeted_count;
 
-    // Keep old broadcast for backward compatibility during transition
-    pthread_cond_broadcast(&f->filter_cond);
-    f->broadcast_signals++;
-
     pthread_mutex_unlock(&f->filter_mutex);
     return 0;
   }
@@ -738,7 +726,6 @@ int execute_filter_input(struct filter_in * const f){
   job->plan = f->fwd_plan;
   job->completion_mutex = &f->filter_mutex;
   job->completion_jobnum = &f->completed_jobs[job->jobnum % ND];
-  job->completion_cond = &f->filter_cond;
   job->terminate = false;
 
   // Set up the job and next input buffer
@@ -1092,6 +1079,20 @@ int delete_filter_input(struct filter_in * master){
   if(master == NULL)
     return -1;
 
+  // Unlink from global filter list before destroying
+  pthread_mutex_lock(&Filter_list_mutex);
+  if(Filter_list_head == master){
+    Filter_list_head = master->next_filter;
+  } else {
+    for(struct filter_in *f = Filter_list_head; f != NULL; f = f->next_filter){
+      if(f->next_filter == master){
+        f->next_filter = master->next_filter;
+        break;
+      }
+    }
+  }
+  pthread_mutex_unlock(&Filter_list_mutex);
+
   ASSERT_UNLOCKED(&master->filter_mutex);
   pthread_mutex_destroy(&master->filter_mutex);
   pthread_cond_destroy(&master->filter_cond);
@@ -1239,6 +1240,7 @@ int set_filter(struct filter_out * const slave,float low,float high,float const 
   memcpy(response,impulse,M * sizeof *response);
   memset(response+M,0,(N-M) * sizeof *response);
   fftwf_execute(fwd_filter_plan);
+  fftwf_destroy_plan(fwd_filter_plan);
 
 #if FILTER_DEBUG
   {

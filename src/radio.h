@@ -237,6 +237,8 @@ struct channel {
     int bin_count;    // Requested bin count
     int allocated_bin_count; // Actual allocated size of bin_data (for safety checks)
     float *bin_data;  // Array of real floats with bin_count elements
+    float *power_buffer;      // Reusable scratch buffer for spectrum_poll() bin merge
+    int power_buffer_size;    // Allocated size of power_buffer in elements
   } spectrum;
 
   // Output
