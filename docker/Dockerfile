@@ -222,6 +222,58 @@ echo "Radiod started at $RADIOD_START_TIME, signaling ubersdr"\n\
     done\n\
 ) &\n\
 \n\
+# Start background thread-stats writer\n\
+# Samples /proc/<pid>/task/<tid>/stat twice over 2 seconds, writes CSV atomically.\n\
+# Uses /dev/shm for the temp file (RAM, no disk writes) then mv to shared volume.\n\
+# Output: /var/run/restart-trigger/radiod-thread-stats.csv\n\
+# Format: name,cpu_pct,cpu_num  (one row per thread, header on every write)\n\
+(\n\
+    STATS_FILE=/var/run/restart-trigger/radiod-thread-stats.csv\n\
+    TMP_FILE=/dev/shm/radiod-thread-stats.tmp\n\
+    SYS_HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)\n\
+    while true; do\n\
+        PID=$(pgrep -x radiod 2>/dev/null | head -1 || true)\n\
+        if [ -z "$PID" ] || [ ! -d "/proc/$PID/task" ]; then\n\
+            sleep 1\n\
+            continue\n\
+        fi\n\
+        TASK_DIR="/proc/$PID/task"\n\
+        declare -A U1 S1\n\
+        for TID_DIR in "$TASK_DIR"/*/; do\n\
+            TID=$(basename "$TID_DIR")\n\
+            STAT=$(cat "$TID_DIR/stat" 2>/dev/null || true)\n\
+            [ -z "$STAT" ] && continue\n\
+            AFTER=$(echo "$STAT" | sed '"'"'s/^[0-9]* (.*) //'"'"')\n\
+            U1[$TID]=$(echo "$AFTER" | awk '"'"'{print $12}'"'"')\n\
+            S1[$TID]=$(echo "$AFTER" | awk '"'"'{print $13}'"'"')\n\
+        done\n\
+        UP1=$(awk '"'"'{print $1}'"'"' /proc/uptime)\n\
+        sleep 2\n\
+        UP2=$(awk '"'"'{print $1}'"'"' /proc/uptime)\n\
+        ELAPSED=$(echo "$UP2 $UP1 $SYS_HZ" | awk '"'"'{printf "%d", ($1-$2)*$3}'"'"')\n\
+        [ "$ELAPSED" -lt 1 ] && ELAPSED=1\n\
+        echo "name,cpu_pct,cpu_num" > "$TMP_FILE"\n\
+        for TID_DIR in "$TASK_DIR"/*/; do\n\
+            TID=$(basename "$TID_DIR")\n\
+            [ -f "$TID_DIR/stat" ] || continue\n\
+            [ -z "${U1[$TID]+x}" ] && continue\n\
+            NAME=$(cat "$TID_DIR/comm" 2>/dev/null | tr -d '"'"'\n'"'"' || echo "?")\n\
+            STAT=$(cat "$TID_DIR/stat" 2>/dev/null || true)\n\
+            [ -z "$STAT" ] && continue\n\
+            AFTER=$(echo "$STAT" | sed '"'"'s/^[0-9]* (.*) //'"'"')\n\
+            U2=$(echo "$AFTER" | awk '"'"'{print $12}'"'"')\n\
+            S2=$(echo "$AFTER" | awk '"'"'{print $13}'"'"')\n\
+            CPU_NUM=$(echo "$AFTER" | awk '"'"'{print $37}'"'"')\n\
+            DU=$(( ${U2:-0} - ${U1[$TID]:-0} ))\n\
+            DS=$(( ${S2:-0} - ${S1[$TID]:-0} ))\n\
+            PCT=$(echo "$DU $DS $ELAPSED" | awk '"'"'{printf "%.1f", ($1+$2)*100/$3}'"'"')\n\
+            echo "${NAME},${PCT},${CPU_NUM}" >> "$TMP_FILE"\n\
+        done\n\
+        unset U1 S1\n\
+        mv "$TMP_FILE" "$STATS_FILE"\n\
+    done\n\
+) &\n\
+\n\
 # Start radiod as PID 1\n\
 exec /usr/local/sbin/radiod "$@"\n\
 ' > /usr/local/bin/start-radiod.sh && \

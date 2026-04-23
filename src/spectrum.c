@@ -25,7 +25,7 @@ int demod_spectrum(void *arg){
     return -1;
   {
     char name[100];
-    snprintf(name,sizeof(name),"spect %u",chan->output.rtp.ssrc);
+    snprintf(name,sizeof(name),"spec %u",chan->output.rtp.ssrc);
     pthread_setname(name);
   }
   struct frontend * const frontend = chan->frontend;
