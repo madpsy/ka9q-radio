@@ -109,6 +109,7 @@ RUN apt-get update && \
     libiniparser1 \
     ca-certificates \
     iproute2 \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install SDR hardware runtime libraries if available
@@ -208,71 +209,95 @@ echo "$RADIOD_START_TIME" > /var/run/restart-trigger/radiod-startup-time\n\
 touch /var/run/restart-trigger/restart-ubersdr\n\
 echo "Radiod started at $RADIOD_START_TIME, signaling ubersdr"\n\
 \n\
-# Start background watcher for restart trigger file\n\
+# Start background watcher for restart trigger file (Python - no fork/exec per poll)\n\
 # When trigger file is detected, kill PID 1 (radiod) to trigger container restart\n\
-(\n\
-    while true; do\n\
-        if [ -f /var/run/restart-trigger/restart ]; then\n\
-            echo "Restart trigger detected from ubersdr, restarting..."\n\
-            rm -f /var/run/restart-trigger/restart\n\
-            kill -TERM 1 || kill -KILL 1\n\
-            exit 0\n\
-        fi\n\
-        sleep 0.5\n\
-    done\n\
-) &\n\
+python3 -c "\n\
+import os, signal, time\n\
+TRIGGER = '"'"'/var/run/restart-trigger/restart'"'"'\n\
+while True:\n\
+    if os.path.exists(TRIGGER):\n\
+        print('"'"'Restart trigger detected from ubersdr, restarting...'"'"', flush=True)\n\
+        os.remove(TRIGGER)\n\
+        os.kill(1, signal.SIGTERM)\n\
+        break\n\
+    time.sleep(2)\n\
+" &\n\
 \n\
-# Start background thread-stats writer\n\
+# Start background thread-stats writer (Python - zero forks per cycle)\n\
 # Samples /proc/<pid>/task/<tid>/stat twice over 2 seconds, writes CSV atomically.\n\
-# Uses /dev/shm for the temp file (RAM, no disk writes) then mv to shared volume.\n\
+# Uses /dev/shm for the temp file (RAM, no disk writes) then os.replace to shared volume.\n\
 # Output: /var/run/restart-trigger/radiod-thread-stats.csv\n\
 # Format: name,cpu_pct,cpu_num  (one row per thread, header on every write)\n\
-(\n\
-    STATS_FILE=/var/run/restart-trigger/radiod-thread-stats.csv\n\
-    TMP_FILE=/dev/shm/radiod-thread-stats.tmp\n\
-    SYS_HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)\n\
-    while true; do\n\
-        PID=$(pgrep -x radiod 2>/dev/null | head -1 || true)\n\
-        if [ -z "$PID" ] || [ ! -d "/proc/$PID/task" ]; then\n\
-            sleep 1\n\
+python3 -c "\n\
+import os, re, time\n\
+\n\
+STATS_FILE = '"'"'/var/run/restart-trigger/radiod-thread-stats.csv'"'"'\n\
+TMP_FILE   = '"'"'/var/run/restart-trigger/radiod-thread-stats.tmp'"'"'\n\
+try:\n\
+    HZ = os.sysconf(os.sysconf_names['"'"'SC_CLK_TCK'"'"'])\n\
+except Exception:\n\
+    HZ = 100\n\
+\n\
+# Greedy match strips "PID (name) " prefix correctly even if name contains ")"\n\
+STAT_RE = re.compile(r'"'"'^\\d+ \\(.*\\) '"'"')\n\
+\n\
+def find_radiod_pid():\n\
+    for entry in os.scandir('"'"'/proc'"'"'):\n\
+        if not entry.name.isdigit():\n\
             continue\n\
-        fi\n\
-        TASK_DIR="/proc/$PID/task"\n\
-        declare -A U1 S1\n\
-        for TID_DIR in "$TASK_DIR"/*/; do\n\
-            TID=$(basename "$TID_DIR")\n\
-            STAT=$(cat "$TID_DIR/stat" 2>/dev/null || true)\n\
-            [ -z "$STAT" ] && continue\n\
-            AFTER=$(echo "$STAT" | sed '"'"'s/^[0-9]* (.*) //'"'"')\n\
-            U1[$TID]=$(echo "$AFTER" | awk '"'"'{print $12}'"'"')\n\
-            S1[$TID]=$(echo "$AFTER" | awk '"'"'{print $13}'"'"')\n\
-        done\n\
-        UP1=$(awk '"'"'{print $1}'"'"' /proc/uptime)\n\
-        sleep 2\n\
-        UP2=$(awk '"'"'{print $1}'"'"' /proc/uptime)\n\
-        ELAPSED=$(echo "$UP2 $UP1 $SYS_HZ" | awk '"'"'{printf "%d", ($1-$2)*$3}'"'"')\n\
-        [ "$ELAPSED" -lt 1 ] && ELAPSED=1\n\
-        echo "name,cpu_pct,cpu_num" > "$TMP_FILE"\n\
-        for TID_DIR in "$TASK_DIR"/*/; do\n\
-            TID=$(basename "$TID_DIR")\n\
-            [ -f "$TID_DIR/stat" ] || continue\n\
-            [ -z "${U1[$TID]+x}" ] && continue\n\
-            NAME=$(cat "$TID_DIR/comm" 2>/dev/null | tr -d '"'"'\n'"'"' || echo "?")\n\
-            STAT=$(cat "$TID_DIR/stat" 2>/dev/null || true)\n\
-            [ -z "$STAT" ] && continue\n\
-            AFTER=$(echo "$STAT" | sed '"'"'s/^[0-9]* (.*) //'"'"')\n\
-            U2=$(echo "$AFTER" | awk '"'"'{print $12}'"'"')\n\
-            S2=$(echo "$AFTER" | awk '"'"'{print $13}'"'"')\n\
-            CPU_NUM=$(echo "$AFTER" | awk '"'"'{print $37}'"'"')\n\
-            DU=$(( ${U2:-0} - ${U1[$TID]:-0} ))\n\
-            DS=$(( ${S2:-0} - ${S1[$TID]:-0} ))\n\
-            PCT=$(echo "$DU $DS $ELAPSED" | awk '"'"'{printf "%.1f", ($1+$2)*100/$3}'"'"')\n\
-            echo "${NAME},${PCT},${CPU_NUM}" >> "$TMP_FILE"\n\
-        done\n\
-        unset U1 S1\n\
-        mv "$TMP_FILE" "$STATS_FILE"\n\
-    done\n\
-) &\n\
+        try:\n\
+            with open(f'"'"'/proc/{entry.name}/comm'"'"') as f:\n\
+                if f.read().strip() == '"'"'radiod'"'"':\n\
+                    return entry.name\n\
+        except OSError:\n\
+            pass\n\
+    return None\n\
+\n\
+def read_thread_stats(pid):\n\
+    # Single pass: read both stat and comm for each thread in one loop.\n\
+    # Returns dict of tid -> (utime, stime, cpu_num, name)\n\
+    stats = {}\n\
+    task_dir = f'"'"'/proc/{pid}/task'"'"'\n\
+    try:\n\
+        tids = os.listdir(task_dir)\n\
+    except OSError:\n\
+        return stats\n\
+    for tid in tids:\n\
+        try:\n\
+            with open(f'"'"'{task_dir}/{tid}/stat'"'"') as f:\n\
+                raw = f.read()\n\
+            fields = STAT_RE.sub('"'"''"'"', raw).split()\n\
+            try:\n\
+                with open(f'"'"'{task_dir}/{tid}/comm'"'"') as f:\n\
+                    name = f.read().strip()\n\
+            except OSError:\n\
+                name = '"'"'?'"'"'\n\
+            stats[tid] = (int(fields[11]), int(fields[12]), fields[36], name)\n\
+        except (OSError, IndexError, ValueError):\n\
+            pass\n\
+    return stats\n\
+\n\
+while True:\n\
+    pid = find_radiod_pid()\n\
+    if pid is None or not os.path.isdir(f'"'"'/proc/{pid}/task'"'"'):\n\
+        time.sleep(1)\n\
+        continue\n\
+    snap1 = read_thread_stats(pid)\n\
+    t1 = time.monotonic()\n\
+    time.sleep(2)\n\
+    snap2 = read_thread_stats(pid)\n\
+    elapsed_ticks = max(1, (time.monotonic() - t1) * HZ)\n\
+    lines = ['"'"'name,cpu_pct,cpu_num'"'"']\n\
+    for tid, (u2, s2, cpu_num, name) in snap2.items():\n\
+        if tid not in snap1:\n\
+            continue\n\
+        u1, s1, _, _ = snap1[tid]\n\
+        pct = (u2 - u1 + s2 - s1) * 100.0 / elapsed_ticks\n\
+        lines.append(f'"'"'{name},{pct:.1f},{cpu_num}'"'"')\n\
+    with open(TMP_FILE, '"'"'w'"'"') as f:\n\
+        f.write('"'"'\\n'"'"'.join(lines) + '"'"'\\n'"'"')\n\
+    os.replace(TMP_FILE, STATS_FILE)\n\
+" &\n\
 \n\
 # Start radiod as PID 1\n\
 exec /usr/local/sbin/radiod "$@"\n\
