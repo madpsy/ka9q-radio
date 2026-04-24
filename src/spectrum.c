@@ -15,7 +15,14 @@
 #include "radio.h"
 
 static float const SPECTRUM_KAISER_BETA = 5.0;
-static float const Spectrum_crossover = 5000; // Switch to summing raw FFT bins above 5 kHz
+static float const Spectrum_crossover = 200; // Switch to summing raw FFT bins above 200 Hz
+                                              // Wide-bin path reads master FFT directly (near-zero CPU).
+                                              // FFT mode only needed below ~200 Hz where sub-40 Hz resolution
+                                              // (finer than the master FFT bin spacing) is actually required.
+                                              // At 200 Hz/bin, binsperbin = 200/40 = 5 master bins per output
+                                              // bin — adequate noise averaging for waterfall display.
+                                              // Previous value of 5000 Hz was unnecessarily conservative,
+                                              // forcing expensive IQ channel creation for 200 Hz–5 kHz views.
 
 // Spectrum analysis thread
 int demod_spectrum(void *arg){
