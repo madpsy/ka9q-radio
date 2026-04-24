@@ -342,11 +342,14 @@ int spectrum_poll(struct channel *chan){
 
     // Form array of bin energies from lowest frequency to high
     // Lowest frequency in power_buffer[0] to simplify interpolation
-    for(int i = 0; i < input_bins; i++){
-      power_buffer[i] = cnrmf(fdomain[binp]);
-      if(++binp == master->bins)
-	binp = 0;
-    }
+    // Split at the wrap point so both segments are branch-free and can be
+    // auto-vectorised by the compiler (AVX2: 4 complex samples/cycle).
+    int seg1 = master->bins - binp; // elements before wrap
+    if(seg1 > input_bins) seg1 = input_bins; // no wrap needed
+    for(int i = 0; i < seg1; i++)
+      power_buffer[i] = cnrmf(fdomain[binp + i]);
+    for(int i = seg1; i < input_bins; i++)
+      power_buffer[i] = cnrmf(fdomain[i - seg1]); // after wrap: starts at fdomain[0]
   } else if(chan->filter.bin_shift > 0){
     // Real input right side up
     // Check if we're trying to cover the full DC-to-Nyquist range
