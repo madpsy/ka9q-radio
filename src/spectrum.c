@@ -67,7 +67,7 @@ int demod_spectrum(void *arg){
   float complex *fft1_in = NULL;
   float complex *fft_out = NULL;
 
-  double gain = 0;
+  float gain = 0;
   int fft_size = 0;
   int fft0_index = 0;
   int fft1_index = 0;
@@ -80,6 +80,7 @@ int demod_spectrum(void *arg){
   realtime(chan->prio - 10); // Drop below demods
 #endif
 
+  int ret = 0; // return value: 0 = normal exit/restart, -1 = fatal (close channel)
   while(1){
     // Check user params
     int bin_count = chan->spectrum.bin_count <= 0 ? 64 : chan->spectrum.bin_count;
@@ -140,7 +141,7 @@ int demod_spectrum(void *arg){
 
 	// The channel filter already normalizes for the size of the forward input FFT, we just handle our own FFT gain
 	// squared because the we're scaling the output of complex norm, not the input bin values
-	gain = 1.0/ ((double)fft_size * fft_size);
+	gain = 1.0f / ((float)fft_size * (float)fft_size);
 
 	int frame_len = samprate / blockrate;
 	int r = create_filter_output(&chan->filter.out,&frontend->in,NULL,frame_len,COMPLEX);
@@ -194,6 +195,19 @@ int demod_spectrum(void *arg){
     if(downconvert(chan) != 0) // Wait for new frame
       break;
 
+    // Spectrum channels are poll-driven: the client must periodically request status to
+    // receive bin data. If no poll has arrived for Channel_idle_timeout blocks (~5 sec),
+    // terminate so the thread doesn't run forever after the client goes away.
+    // (Audio channels are not polled after setup, so this check is spectrum-specific.)
+    // Set demod_type to -1 (invalid) so demod_thread() calls close_chan() instead of restarting.
+    if(Channel_idle_timeout > 0 && chan->status.blocks_since_poll > (uint64_t)Channel_idle_timeout){
+      fprintf(stderr,"INFO: Spectrum channel %u idle for %lu blocks, terminating\n",
+              chan->output.rtp.ssrc, (unsigned long)chan->status.blocks_since_poll);
+      chan->demod_type = -1;
+      ret = -1;
+      break;
+    }
+
     if(bin_bw > Spectrum_crossover)
       continue; // Do the rest at poll time
 
@@ -222,14 +236,11 @@ int demod_spectrum(void *arg){
 	// Copy requested number of bins to user
 	// Should verify correctness for combinations of even and odd bin_count and actual_bin_count
 	int k = 0;
-	double alpha = 0.5;
-
 	for(int j = 0; j < bin_count; j++,k++){
 	  if(j == bin_count/2)
 	    k += fft_size - bin_count; // jump to negative spectrum of FFT
-	  double p = gain * cnrmf(fft_out[k]); // Take power spectrum
-	  chan->spectrum.bin_data[j] += alpha * (p - chan->spectrum.bin_data[j]); // average it in
-	  assert(isfinite(chan->spectrum.bin_data[j]));
+	  float p = gain * cnrmf(fft_out[k]); // Take power spectrum
+	  chan->spectrum.bin_data[j] = 0.5f * (p + chan->spectrum.bin_data[j]); // average it in
 	}
       }
     }
@@ -247,7 +258,7 @@ int demod_spectrum(void *arg){
   FREE(chan->spectrum.bin_data);
   FREE(chan->spectrum.power_buffer);
   chan->spectrum.power_buffer_size = 0;
-  return 0;
+  return ret;
 }
 
 // Called at poll time in wide bin mode
