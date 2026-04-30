@@ -39,6 +39,38 @@ static int encode_radio_status_ex(struct frontend const *frontend,struct channel
 static int send_radio_status_ex(struct sockaddr const *sock,struct frontend const *frontend,struct channel *chan,bool skip_spectrum_poll);
 static bool decode_radio_commands_with_source(struct channel *chan,uint8_t const *buffer,int length,char const *source_ip);
 
+// Returns true if the command buffer contains only poll-type fields (COMMAND_TAG, OUTPUT_SSRC, EOL)
+// and no actual parameters that would justify creating a new channel
+static bool is_poll_only(uint8_t const *buffer,int length){
+  uint8_t const *cp = buffer;
+  while(cp < buffer + length){
+    enum status_type const type = *cp++;
+    if(type == EOL)
+      break;
+    unsigned int optlen = *cp++;
+    if(optlen & 0x80){
+      int length_of_length = optlen & 0x7f;
+      optlen = 0;
+      while(length_of_length > 0){
+        optlen <<= 8;
+        optlen |= *cp++;
+        length_of_length--;
+      }
+    }
+    if(cp + optlen > buffer + length)
+      break;
+    switch(type){
+    case COMMAND_TAG:
+    case OUTPUT_SSRC:
+      break; // poll-only fields, keep scanning
+    default:
+      return false; // found a real parameter
+    }
+    cp += optlen;
+  }
+  return true; // only poll fields seen
+}
+
 // Radio status reception and transmission thread
 void *radio_status(void *arg){
   pthread_setname("radio stat");
@@ -72,11 +104,12 @@ void *radio_status(void *arg){
     case 0xffffffff:
       // Ask all threads to dump their status in a staggered manner
       for(int i=0; i < Nchannels; i++){
-	struct channel *chan = &Channel_list[i];
-	pthread_mutex_lock(&chan->status.lock);
-	if(chan->inuse && chan->output.rtp.ssrc != 0xffffffff && chan->output.rtp.ssrc != 0)
-	  chan->status.global_timer = (i >> 1) + 1; // two at a time
-	pthread_mutex_unlock(&chan->status.lock);
+ struct channel *chan = &Channel_list[i];
+ pthread_mutex_lock(&chan->status.lock);
+ if(chan->inuse && chan->output.rtp.ssrc != 0xffffffff && chan->output.rtp.ssrc != 0
+    && chan->tune.freq != 0) // Don't schedule status for freq=0 channels; let them expire
+   chan->status.global_timer = (i >> 1) + 1; // two at a time
+ pthread_mutex_unlock(&chan->status.lock);
       }
       break;
     default:
@@ -101,8 +134,15 @@ void *radio_status(void *arg){
    if(oops)
      FREE(cmd);
  } else {
-	  // Channel doesn't yet exist. Create, execute the rest of this command here, and then start the new demod
-	  if((chan = create_chan(ssrc)) == NULL){ // possible race here?
+	  // Channel doesn't yet exist.
+	  // Don't recreate a channel just because a client is polling a dead SSRC —
+	  // that would cause the channel to be recreated every time it expires.
+	  // Only create a new channel if the command contains actual parameters.
+	  if(is_poll_only(buffer+1,length-1)){
+	    // Pure poll for a non-existent channel; ignore silently
+	    if(Verbose)
+	      fprintf(stderr,"Poll-only command for non-existent ssrc %'u from %s, ignoring\n",ssrc,sender_ip);
+	  } else if((chan = create_chan(ssrc)) == NULL){ // possible race here?
 	    // Creation failed, e.g., no output stream
 	    fprintf(stderr,"Dynamic create of ssrc %'u failed; is 'data =' set in [global]?\n",ssrc);
 	  } else {
