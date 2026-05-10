@@ -1,0 +1,24 @@
+# Compiled object files and binaries - must not be sent to Docker build context
+# as they are host-arch (amd64) and will break cross-compilation for arm64
+src/*.o
+src/*.a
+src/*.so
+src/*.so.*
+
+# Build artifacts in subdirectories
+**/*.o
+**/*.a
+
+# Git metadata (not needed in build context)
+.git
+.github
+
+# Editor/IDE files
+.trunk
+*.swp
+*.swo
+.DS_Store
+
+# Docs that aren't needed for the build
+docs/*.pdf
+docs/*.numbers

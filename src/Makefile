@@ -18,7 +18,16 @@ ifdef SANITIZE
      LDOPTS = -fsanitize=address -fsanitize=undefined
 endif
 
-ARCHOPTS = -march=native
+# Use -march=native only on x86; on aarch64 use a safe ARMv8 baseline so that
+# cross-compiled Docker images (built under QEMU) don't emit instructions that
+# are illegal on the target hardware (e.g. Pi 5 Cortex-A76 vs QEMU virtual CPU).
+# Native aarch64 builds (e.g. compiling directly on a Pi) still benefit from -O3.
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),aarch64)
+    ARCHOPTS = -march=armv8-a+crc
+else
+    ARCHOPTS = -march=native
+endif
 # do NOT set -ffast-math or -ffinite-math-only; NANs are widely used as 'variable not set' sentinels
 COPTS = -std=gnu11 -pthread -Wall -funsafe-math-optimizations -fno-math-errno -fcx-limited-range -freciprocal-math -fno-trapping-math -D_GNU_SOURCE=1 -Wextra -MMD -MP
 COPTS += -fPIC

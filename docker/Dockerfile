@@ -46,7 +46,8 @@ COPY . /build/ka9q-radio
 
 # Build and install ka9q-radio
 WORKDIR /build/ka9q-radio
-RUN make && \
+RUN make clean && \
+    make && \
     # Create radio user first (needed by other install steps)
     /usr/sbin/adduser --quiet --system --group radio && \
     # Install src binaries

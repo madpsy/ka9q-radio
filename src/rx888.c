@@ -97,6 +97,8 @@ struct sdrstate {
   double reference;
   bool randomizer;
   bool dither;
+  bool bias_hf;   // Bias-T on HF (direct sampling) input
+  bool bias_vhf;  // Bias-T on VHF (R828 tuner) input
   uint32_t gpios;
   uint64_t last_sample_count; // Used to verify sample rate
   int64_t last_count_time;
@@ -158,6 +160,8 @@ static char const *Rx888_keys[] = {
   "agc-low-threshold",
   "att", // synonym for atten
   "atten", // fixed attenuator gain, dB. Either -10 or +10 is interprepted as 10 dB of attenuation
+  "bias-hf",  // Bias-T (phantom power) on HF antenna input
+  "bias-vhf", // Bias-T (phantom power) on VHF antenna input
   "calibrate", // Set to zero when an external GPSDO or Rb/Cs reference is used
   "description",
   "device",
@@ -237,6 +241,14 @@ int rx888_setup(struct frontend * const frontend,dictionary const * const dictio
   sdr->dither = config_getboolean(dictionary,section,"dither",false);
   // Enable/output output randomization
   sdr->randomizer = config_getboolean(dictionary,section,"rand",false);
+  // Enable/disable bias-T on HF input
+  sdr->bias_hf = config_getboolean(dictionary,section,"bias-hf",false);
+  if(sdr->bias_hf)
+    sdr->gpios |= BIAS_HF;
+  // Enable/disable bias-T on VHF input
+  sdr->bias_vhf = config_getboolean(dictionary,section,"bias-vhf",false);
+  if(sdr->bias_vhf)
+    sdr->gpios |= BIAS_VHF;
   rx888_set_dither_and_randomizer(sdr,sdr->dither,sdr->randomizer);
 
   // RF Gain calibration
@@ -357,11 +369,11 @@ int rx888_setup(struct frontend * const frontend,dictionary const * const dictio
 
   Power_smooth = -expm1(-xfer_time/Ptc);
 
-  fprintf(stderr,"RX888 AGC %s, nominal gain %.1f dB, actual gain %.1f dB, atten %.1f dB, gain cal %.1f dB, dither %d, randomizer %d, USB queue depth %d, USB request size %'d * pktsize %'d = %'d bytes (%g sec), new-clock %d\n",
-	  frontend->rf_agc ? "on" : "off",
-	  gain,frontend->rf_gain,frontend->rf_atten,frontend->rf_level_cal,
-sdr->dither,sdr->randomizer,sdr->queuedepth,sdr->reqsize,sdr->pktsize,sdr->reqsize * sdr->pktsize,
-	  xfer_time,sdr->new_clock);
+  fprintf(stderr,"RX888 AGC %s, nominal gain %.1f dB, actual gain %.1f dB, atten %.1f dB, gain cal %.1f dB, dither %d, randomizer %d, bias-hf %d, bias-vhf %d, USB queue depth %d, USB request size %'d * pktsize %'d = %'d bytes (%g sec), new-clock %d\n",
+   frontend->rf_agc ? "on" : "off",
+   gain,frontend->rf_gain,frontend->rf_atten,frontend->rf_level_cal,
+   sdr->dither,sdr->randomizer,sdr->bias_hf,sdr->bias_vhf,sdr->queuedepth,sdr->reqsize,sdr->pktsize,sdr->reqsize * sdr->pktsize,
+   xfer_time,sdr->new_clock);
 
 #if 0
   // VHF-UHF tuning
@@ -690,7 +702,7 @@ static int rx888_usb_init(struct sdrstate *const sdr,const char * const firmware
     fprintf(stderr,", loading rx888 firmware file %s",full_firmware_file);
     if(ezusb_load_ram(handle,full_firmware_file,FX_TYPE_FX3,IMG_TYPE_IMG,1) == 0){
       fprintf(stderr,", done\n");
-      sleep(1); // how long should this be?
+      sleep(2); // Pi 5 (RP1 USB controller) needs longer re-enumeration time than Pi 4
     } else {
       fprintf(stderr,", failed for device %d.%d (logical)\n",
 	      libusb_get_bus_number(device),libusb_get_device_address(device));
