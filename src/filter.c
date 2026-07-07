@@ -816,8 +816,40 @@ int execute_filter_output(struct filter_out * const slave,int const shift){
   }
   // NEW: Wait on per-slave condition variable to eliminate thundering herd
   // Each slave now only wakes when its specific job is ready
-  while((int)(slave->next_jobnum - master->completed_jobs[slave->next_jobnum % ND]) > 0)
-    pthread_cond_wait(&slave->slave_cond,&master->filter_mutex);
+  //
+  // The wait is bounded (1 s) because the targeted wakeup above signals a slave
+  // only on exact equality (slave->next_jobnum == job->jobnum).  Two rare states
+  // can otherwise strand a slave asleep forever:
+  //   1. The predicate is already satisfied but the equality signal was missed
+  //      (e.g. the slave's awaited job N was lost/wedged while a later job N+ND
+  //      overwrote completed_jobs[N % ND]).  The periodic re-check below simply
+  //      falls out of the loop and resumes.
+  //   2. The slave's next_jobnum is >1 ahead of the newest completed job — a
+  //      state unreachable in normal operation (ahead-by-1 is the normal waiting
+  //      state) that can only mean the master's job counter was rebased.  The
+  //      equality wakeup can then never fire, so resync instead of deadlocking.
+  // In normal operation the signal arrives within one blocktime (~20 ms), the
+  // timeout branch never runs, and behavior is identical to the unbounded wait.
+  while((int)(slave->next_jobnum - master->completed_jobs[slave->next_jobnum % ND]) > 0){
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME,&deadline); // slave_cond uses the default clock (NULL attrs)
+    deadline.tv_sec += 1;
+    if(pthread_cond_timedwait(&slave->slave_cond,&master->filter_mutex,&deadline) == ETIMEDOUT){
+      // Find the newest completed job across the ring
+      unsigned newest = master->completed_jobs[0];
+      for(int i = 1; i < ND; i++)
+ if((int)(master->completed_jobs[i] - newest) > 0)
+   newest = master->completed_jobs[i];
+      // Ahead-by-1 is the normal waiting state (even with a stalled front end) — keep waiting.
+      // Ahead-by-2+ means the master's job counter went backwards; resync to recover.
+      if((int)(slave->next_jobnum - newest) > 1){
+ fprintf(stderr,"filter slave desync: next_jobnum %u, master newest %u - resyncing\n",
+  slave->next_jobnum,newest);
+ slave->block_drops++;
+ slave->next_jobnum = newest; // predicate now <= 0; resync below advances to newest+1
+      }
+    }
+  }
   // We don't modify the master's output data, we create our own
   float complex const * const fdomain = master->fdomain[slave->next_jobnum % ND];
   // in case we just waited so long that the buffer wrapped, resynch
