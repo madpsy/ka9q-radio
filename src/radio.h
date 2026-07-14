@@ -162,8 +162,18 @@ struct channel {
     double complex phase_adjust; // Block rotation of phase
     bool beam;          // Use beamforming on independent I&Q inputs
     double complex a_weight; // A & B weights when beamforming
-    double complex b_weight; 
+    double complex b_weight;
   } filter;
+
+  // Instrumentation: time spent in execute_filter_output() waiting for the next master FFT block
+  // Normally under one blocktime; longer means the channel missed at least one block deadline
+  struct {
+    int64_t log_time;            // Last time slow waits were reported (0 = not yet initialized)
+    int64_t max_wait;            // Longest wait since last report, ns
+    unsigned long slow_count;    // Waits of two blocktimes or more since last report
+    unsigned long slow100_count; // Waits of 100 ms or more (several lost blocks, audible)
+    unsigned long slow500_count; // Waits of 500 ms or more (severe; matches consumer-side gap reports)
+  } wait_stats;
 
   // Optional secondary filter (linear demod only)
   struct {

@@ -620,11 +620,16 @@ void *run_fft(void *p){
     if(job->completion_jobnum)
       *job->completion_jobnum = job->jobnum;
 
-    // NEW: Signal only slaves waiting for THIS specific job (targeted wakeup)
+    // NEW: Signal slaves whose awaited job is now available (targeted wakeup)
+    // Use ">= 0" (at-or-past) rather than strict "==" so a slave that fell behind
+    // or hadn't yet parked in pthread_cond_timedwait() is still woken. Strict
+    // equality could miss such a slave, leaving it to sleep until the 1 s timeout.
+    // The wait predicate re-checks under filter_mutex, so an extra signal is a
+    // harmless no-op if the slave doesn't actually need this job yet.
     if(job->fin != NULL) {
       int targeted_count = 0;
       for (struct filter_out *slave = job->fin->slave_list_head; slave != NULL; slave = slave->next_slave) {
-        if (slave->next_jobnum == job->jobnum) {
+        if ((int)(job->jobnum - slave->next_jobnum) >= 0) {
           pthread_cond_signal(&slave->slave_cond);
           targeted_count++;
         }
@@ -689,11 +694,14 @@ int execute_filter_input(struct filter_in * const f){
     pthread_mutex_lock(&f->filter_mutex);
     f->completed_jobs[jobnum % ND] = jobnum;
 
-    // NEW: Signal only slaves waiting for THIS specific job
-    // This eliminates the thundering herd problem
+    // NEW: Signal slaves whose awaited job is now available (targeted wakeup)
+    // This eliminates the thundering herd problem.
+    // Use ">= 0" (at-or-past) rather than strict "==" so a slave that fell behind
+    // or hadn't yet parked in pthread_cond_timedwait() is still woken. The wait
+    // predicate re-checks under filter_mutex, so an extra signal is a harmless no-op.
     int targeted_count = 0;
     for (struct filter_out *slave = f->slave_list_head; slave != NULL; slave = slave->next_slave) {
-      if (slave->next_jobnum == jobnum) {
+      if ((int)(jobnum - slave->next_jobnum) >= 0) {
         pthread_cond_signal(&slave->slave_cond);
         targeted_count++;
       }
@@ -814,22 +822,18 @@ int execute_filter_output(struct filter_out * const slave,int const shift){
     slave->block_drops += nextblock - slave->next_jobnum;
     slave->next_jobnum = nextblock;
   }
-  // NEW: Wait on per-slave condition variable to eliminate thundering herd
-  // Each slave now only wakes when its specific job is ready
+  // Wait on this slave's private condition variable (per-slave to avoid the thundering herd).
+  // The targeted wakeup in the FFT completion path signals every slave whose awaited job is
+  // now available (jobnum - next_jobnum >= 0), so in normal operation the signal arrives within
+  // one blocktime (~20 ms) and the timeout branch below never runs.
   //
-  // The wait is bounded (1 s) because the targeted wakeup above signals a slave
-  // only on exact equality (slave->next_jobnum == job->jobnum).  Two rare states
-  // can otherwise strand a slave asleep forever:
-  //   1. The predicate is already satisfied but the equality signal was missed
-  //      (e.g. the slave's awaited job N was lost/wedged while a later job N+ND
-  //      overwrote completed_jobs[N % ND]).  The periodic re-check below simply
-  //      falls out of the loop and resumes.
-  //   2. The slave's next_jobnum is >1 ahead of the newest completed job — a
-  //      state unreachable in normal operation (ahead-by-1 is the normal waiting
-  //      state) that can only mean the master's job counter was rebased.  The
-  //      equality wakeup can then never fire, so resync instead of deadlocking.
-  // In normal operation the signal arrives within one blocktime (~20 ms), the
-  // timeout branch never runs, and behavior is identical to the unbounded wait.
+  // The wait is still bounded (1 s) as a safety net against two rare states:
+  //   1. The predicate is already satisfied but a wakeup was somehow missed. The periodic
+  //      re-check simply falls out of the loop and resumes.
+  //   2. next_jobnum is >1 ahead of the newest completed job (only possible if the master's
+  //      job counter was rebased), so no wakeup can ever fire — resync instead of deadlocking.
+  // If the timeout ever fires we record it (rate-limited) so a recurrence is diagnosable
+  // without flooding the log.
   while((int)(slave->next_jobnum - master->completed_jobs[slave->next_jobnum % ND]) > 0){
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME,&deadline); // slave_cond uses the default clock (NULL attrs)
@@ -840,10 +844,23 @@ int execute_filter_output(struct filter_out * const slave,int const shift){
       for(int i = 1; i < ND; i++)
  if((int)(master->completed_jobs[i] - newest) > 0)
    newest = master->completed_jobs[i];
+
+      // A timeout means a wakeup was missed or the front end stalled: this is the path that
+      // used to cause the ~1 s "slow waits" stalls. Count every occurrence, but rate-limit the
+      // detail line to at most once per 10 s per slave so a widespread stall can't flood stderr.
+      slave->wait_timeouts++;
+      int64_t const nowd = gps_time_ns();
+      if(nowd >= slave->last_timeout_log_ns + 10 * BILLION){
+ slave->last_timeout_log_ns = nowd;
+ fprintf(stderr,"filter slave slow wait timeout: next_jobnum %u, master newest %u, behind_by %d, total_timeouts %lu, drops %u\n",
+  slave->next_jobnum,newest,(int)(newest - slave->next_jobnum),
+  slave->wait_timeouts,slave->block_drops);
+      }
+
       // Ahead-by-1 is the normal waiting state (even with a stalled front end) — keep waiting.
       // Ahead-by-2+ means the master's job counter went backwards; resync to recover.
       if((int)(slave->next_jobnum - newest) > 1){
- fprintf(stderr,"filter slave desync: next_jobnum %u, master newest %u - resyncing\n",
+ fprintf(stderr,"filter slave slow wait desync: next_jobnum %u, master newest %u - resyncing\n",
   slave->next_jobnum,newest);
  slave->block_drops++;
  slave->next_jobnum = newest; // predicate now <= 0; resync below advances to newest+1

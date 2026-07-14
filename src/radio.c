@@ -1446,8 +1446,43 @@ int downconvert(struct channel *chan){
     chan->tp1 = shift;
     chan->tp2 = remainder;
 
+    int64_t const wait_start = gps_time_ns();
     execute_filter_output(&chan->filter.out,shift); // block until new data frame
+    int64_t const now = gps_time_ns();
     chan->status.blocks_since_poll++;
+
+    // Track how long we waited for the new block. A new block normally arrives every
+    // blocktime (20 ms default), so two blocktimes or more means we missed a deadline.
+    {
+      int64_t const waited = now - wait_start;
+      int64_t const slow_wait = (int64_t)(2 * Blocktime * MILLION); // ms -> ns
+      if(waited > chan->wait_stats.max_wait)
+	chan->wait_stats.max_wait = waited;
+      if(waited >= slow_wait)
+	chan->wait_stats.slow_count++;
+      if(waited >= 100 * MILLION)
+	chan->wait_stats.slow100_count++;
+      if(waited >= 500 * MILLION)
+	chan->wait_stats.slow500_count++;
+      if(chan->wait_stats.log_time == 0)
+	chan->wait_stats.log_time = now; // First block after channel start
+      else if(now >= chan->wait_stats.log_time + 60 * BILLION){
+ // Log any channel type (linear, FM, spectrum, ...) when something was actually slow.
+ // All demod types wait on the same execute_filter_output() path, so all can stall;
+ // the block_drops count shows how much data was actually lost to the skip-ahead.
+ if(chan->wait_stats.slow_count > 0)
+   fprintf(stderr,"%s %u: slow waits for new data in last 60 seconds: >%lld ms: %lu, >100 ms: %lu, >500 ms: %lu, max %lld ms, drops %u\n",
+    demod_name_from_type(chan->demod_type),chan->output.rtp.ssrc,(long long)(slow_wait / MILLION),
+    chan->wait_stats.slow_count,chan->wait_stats.slow100_count,chan->wait_stats.slow500_count,
+    (long long)(chan->wait_stats.max_wait / MILLION),
+    chan->filter.out.block_drops);
+	chan->wait_stats.slow_count = 0;
+	chan->wait_stats.slow100_count = 0;
+	chan->wait_stats.slow500_count = 0;
+	chan->wait_stats.max_wait = 0;
+	chan->wait_stats.log_time = now;
+      }
+    }
 
     if(chan->filter.out.output.c == NULL){
       chan->filter.bin_shift = shift; // Needed by spectrum.c

@@ -96,6 +96,10 @@ struct filter_out {
   unsigned block_drops;          // Lost frequency domain blocks, e.g., from late scheduling of slave thread
   int rcnt;                 // Samples read from output buffer
 
+  // Diagnostics for the (should-be-rare) fallback-timeout path in execute_filter_output()
+  unsigned long wait_timeouts;   // Cumulative count of pthread_cond_timedwait() timeouts (missed wakeups)
+  int64_t last_timeout_log_ns;   // gps_time_ns of last timeout log line, for rate limiting
+
   // Per-slave synchronization to eliminate thundering herd
   pthread_cond_t slave_cond;         // This slave's private condition variable
   struct filter_out *next_slave;     // Next slave in master's linked list

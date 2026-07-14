@@ -38,6 +38,8 @@ static float const Nyquist = 0.47;  // Upper end of usable bandwidth, relative t
 static float const AGC_upper_limit = -15.0;   // Reduce RF gain if A/D level exceeds this in dBFS
 static float const AGC_lower_limit = -26.0;   // Increase RF gain if level is below this in dBFS
 static int const AGC_interval = 1;           // Seconds between runs of AGC loop
+static int64_t const Data_gap_ns = 250 * MILLION; // Report gaps in A/D data longer than this, ns
+static int64_t const Gap_log_interval_ns = 60 * BILLION; // How often to log the gap count, ns
 static float const Start_gain = 10.0;         // Initial VGA gain, dB
 static double Power_smooth; // Arbitrary exponential smoothing factor for front end power estimate
 static double const Ptc  = 0.1; // 100 ms time constant for computing Power_smooth
@@ -82,6 +84,9 @@ struct sdrstate {
   struct libusb_transfer **transfers; // List of transfer structures.
   unsigned char **databuffers;        // List of data buffers.
   long long last_callback_time;
+  int64_t last_data_time;       // Time of last successful (data-carrying) callback
+  int64_t gap_log_time;         // Last time the data gap count was logged
+  unsigned long data_gap_count; // Data callbacks arriving >= Data_gap_ns after the previous one
 
   // USB transfer
   int xfers_in_progress;
@@ -461,6 +466,8 @@ static void *proc_rx888(void *arg){
     int64_t const now = gps_time_ns();
     sdr->last_callback_time = now;
     sdr->last_count_time = now;
+    sdr->last_data_time = now;
+    sdr->gap_log_time = now;
 
     int ret __attribute__ ((unused));
     ret = rx888_start_rx(sdr,rx_callback);
@@ -473,10 +480,21 @@ static void *proc_rx888(void *arg){
     // so we check more directly how long it's been since we last got data
     // sdr->last_callback_time is set in rx_callback()
     int const maxtime = 5;
-    if(gps_time_ns() > sdr->last_callback_time + maxtime * BILLION){
+    int64_t const now = gps_time_ns();
+    if(now > sdr->last_callback_time + maxtime * BILLION){
       Stop_transfers = true;
       fprintf(stderr,"No rx888 data for %d seconds, quitting\n",maxtime);
       break;
+    }
+    // Regularly report how often the A/D data stream paused, even when it didn't.
+    // The count is maintained in rx_callback(), which runs in this thread via
+    // libusb_handle_events_timeout_completed(), so no locking is needed.
+    if(now >= sdr->gap_log_time + Gap_log_interval_ns){
+      fprintf(stderr,"no data for at least %lldms from rx888 in last %lld seconds: %lu\n",
+	      (long long)(Data_gap_ns / MILLION),(long long)(Gap_log_interval_ns / BILLION),
+	      sdr->data_gap_count);
+      sdr->data_gap_count = 0;
+      sdr->gap_log_time = now;
     }
     struct timeval tv;
     tv.tv_sec = 1;
@@ -578,6 +596,12 @@ static void rx_callback(struct libusb_transfer * const transfer){
   // successful USB transfer
   int const size = transfer->actual_length;
   sdr->success_count++;
+
+  // Count interruptions in the A/D data stream; reported periodically by proc_rx888()
+  // Measured between data-carrying callbacks, so failed transfers above count as part of a gap
+  if(now >= sdr->last_data_time + Data_gap_ns)
+    sdr->data_gap_count++;
+  sdr->last_data_time = now;
 
   // Feed directly into FFT input buffer, accumulate energy
   double in_energy = 0; // A/D energy accumulator
