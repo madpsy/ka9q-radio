@@ -61,7 +61,7 @@ struct filter_in {
   fftwf_plan fwd_plan;               // FFT (time -> frequency)
 
   pthread_mutex_t filter_mutex;      // Synchronization for sequence number
-  pthread_cond_t filter_cond;        // DEPRECATED: kept for compatibility, will be removed
+  pthread_cond_t filter_cond;        // Broadcast to all slaves when a new block completes (default wakeup path)
 
   struct filter_out *slave_list_head; // Linked list of all slaves waiting on this master
 
@@ -76,6 +76,10 @@ struct filter_in {
   unsigned int next_jobnum;
   unsigned int completed_jobs[ND];
   bool perform_inline;       // Perform FFT inline, don't use worker threads (better for small FFTs)
+
+  // Tier 3 diagnostics: detect master-side stalls (front-end or FFT worker)
+  int64_t last_block_ns;     // gps_time_ns() when the last block was completed
+  int64_t last_gap_log_ns;   // gps_time_ns() of last master-gap log line (rate limiting)
 };
 
 struct filter_out {
@@ -99,6 +103,10 @@ struct filter_out {
   // Diagnostics for the (should-be-rare) fallback-timeout path in execute_filter_output()
   unsigned long wait_timeouts;   // Cumulative count of pthread_cond_timedwait() timeouts (missed wakeups)
   int64_t last_timeout_log_ns;   // gps_time_ns of last timeout log line, for rate limiting
+
+  // Tier 1 resync diagnostics: one-shot log when a slave first falls >= ND blocks behind
+  unsigned resync_events;        // Cumulative count of hard-resync events (slave fell >= ND behind)
+  bool first_resync_logged;      // True after the first resync has been logged (one-shot latch)
 
   // Per-slave synchronization to eliminate thundering herd
   pthread_cond_t slave_cond;         // This slave's private condition variable

@@ -1468,14 +1468,15 @@ int downconvert(struct channel *chan){
 	chan->wait_stats.log_time = now; // First block after channel start
       else if(now >= chan->wait_stats.log_time + 60 * BILLION){
  // Log any channel type (linear, FM, spectrum, ...) when something was actually slow.
- // All demod types wait on the same execute_filter_output() path, so all can stall;
- // the block_drops count shows how much data was actually lost to the skip-ahead.
+ // All demod types wait on the same execute_filter_output() path, so all can stall.
+ // block_drops: blocks skipped by the hard-resync (data lost). resync_events: how many
+ // times the slave fell >= ND blocks behind and needed a hard-resync to recover.
  if(chan->wait_stats.slow_count > 0)
-   fprintf(stderr,"%s %u: slow waits for new data in last 60 seconds: >%lld ms: %lu, >100 ms: %lu, >500 ms: %lu, max %lld ms, drops %u\n",
+   fprintf(stderr,"%s %u: slow waits for new data in last 60 seconds: >%lld ms: %lu, >100 ms: %lu, >500 ms: %lu, max %lld ms, drops %u, resyncs %u\n",
     demod_name_from_type(chan->demod_type),chan->output.rtp.ssrc,(long long)(slow_wait / MILLION),
     chan->wait_stats.slow_count,chan->wait_stats.slow100_count,chan->wait_stats.slow500_count,
     (long long)(chan->wait_stats.max_wait / MILLION),
-    chan->filter.out.block_drops);
+    chan->filter.out.block_drops,chan->filter.out.resync_events);
 	chan->wait_stats.slow_count = 0;
 	chan->wait_stats.slow100_count = 0;
 	chan->wait_stats.slow500_count = 0;

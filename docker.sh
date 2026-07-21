@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION=0.8.2
+VERSION=0.8.3
 IMAGE=madpsy/ka9q-radio
 
 # Parse command line arguments

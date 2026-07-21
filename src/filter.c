@@ -8,6 +8,20 @@
 //#define LIQUID 1 // Experimental use of parks-mcclellan in filter generation
 #define FFT_PRIO 95 // Runs at very high real time priority
 
+// Slave wakeup strategy (hard-coded feature flag).
+//   0 = broadcast on master->filter_cond (ORIGINAL design; self-healing, immune to lost wakeups).
+//       Every slave re-checks its own predicate on wake, so a mistimed signal is harmless because
+//       the next block's broadcast re-arms all slaves. Correct for the steady-state pipeline where
+//       every slave is parked waiting for the next block when it lands.
+//   1 = targeted per-slave pthread_cond_signal (thundering-herd optimization). Signals only the
+//       slaves the producer thinks need waking. A signal to a slave that is NOT currently parked
+//       (i.e. it's in its brief per-block compute window) is silently lost, so that slave waits
+//       out the full 1 s safety timeout -> "behind_by 49" on an otherwise idle machine.
+// Default 0 restores correctness. Set to 1 to reproduce/measure the targeted path.
+#ifndef FILTER_TARGETED_WAKEUP
+#define FILTER_TARGETED_WAKEUP 0
+#endif
+
 #define MYNEW 1
 #define _GNU_SOURCE 1
 #include <assert.h>
@@ -620,13 +634,32 @@ void *run_fft(void *p){
     if(job->completion_jobnum)
       *job->completion_jobnum = job->jobnum;
 
-    // NEW: Signal slaves whose awaited job is now available (targeted wakeup)
+    // Tier 3: detect master-side stalls in the worker-thread path.
+    // Same logic as the inline path above; both paths hold filter_mutex here.
+    if(job->fin != NULL){
+      struct filter_in * const fin = job->fin;
+      int64_t const now_ns = gps_time_ns();
+      if(fin->last_block_ns != 0){
+        int64_t const gap_ns = now_ns - fin->last_block_ns;
+        if(gap_ns > (int64_t)ND * 20000000LL && now_ns >= fin->last_gap_log_ns + 10 * BILLION){
+          fin->last_gap_log_ns = now_ns;
+          fprintf(stderr,
+            "filter master block gap %lld ms (worker, jobnum %u) — possible stall source;"
+            " slaves may fall behind\n",
+            (long long)(gap_ns / MILLION), job->jobnum);
+        }
+      }
+      fin->last_block_ns = now_ns;
+    }
+
+    // Signal slaves whose awaited job is now available (targeted wakeup).
     // Use ">= 0" (at-or-past) rather than strict "==" so a slave that fell behind
     // or hadn't yet parked in pthread_cond_timedwait() is still woken. Strict
     // equality could miss such a slave, leaving it to sleep until the 1 s timeout.
     // The wait predicate re-checks under filter_mutex, so an extra signal is a
     // harmless no-op if the slave doesn't actually need this job yet.
     if(job->fin != NULL) {
+#if FILTER_TARGETED_WAKEUP
       int targeted_count = 0;
       for (struct filter_out *slave = job->fin->slave_list_head; slave != NULL; slave = slave->next_slave) {
         if ((int)(job->jobnum - slave->next_jobnum) >= 0) {
@@ -635,6 +668,12 @@ void *run_fft(void *p){
         }
       }
       job->fin->targeted_signals += targeted_count;
+#else
+      // Broadcast: wake every slave on this master. Each re-checks its own predicate under
+      // filter_mutex, so extra wakeups are harmless and no wakeup can be lost.
+      pthread_cond_broadcast(&job->fin->filter_cond);
+      job->fin->broadcast_signals++;
+#endif
     }
 
     if(job->completion_mutex)
@@ -694,11 +733,34 @@ int execute_filter_input(struct filter_in * const f){
     pthread_mutex_lock(&f->filter_mutex);
     f->completed_jobs[jobnum % ND] = jobnum;
 
-    // NEW: Signal slaves whose awaited job is now available (targeted wakeup)
+    // Tier 3: detect master-side stalls (front-end or inline FFT taking too long).
+    // A gap > ND block-periods means the master itself stalled long enough to cause slaves
+    // to fall behind. Log once per 10 s so a sustained stall doesn't flood stderr.
+    // last_block_ns == 0 on the very first block; skip the gap check then.
+    {
+      int64_t const now_ns = gps_time_ns();
+      if(f->last_block_ns != 0){
+        int64_t const gap_ns = now_ns - f->last_block_ns;
+        // Threshold: ND block-periods. We don't know the exact block period here, but
+        // ND * 20 ms = 80 ms is the point at which a slave can fall >= ND behind.
+        // Use 80 ms (ND * 20000000 ns) as a conservative fixed threshold.
+        if(gap_ns > (int64_t)ND * 20000000LL && now_ns >= f->last_gap_log_ns + 10 * BILLION){
+          f->last_gap_log_ns = now_ns;
+          fprintf(stderr,
+            "filter master block gap %lld ms (inline, jobnum %u) — possible stall source;"
+            " slaves may fall behind\n",
+            (long long)(gap_ns / MILLION), jobnum);
+        }
+      }
+      f->last_block_ns = now_ns;
+    }
+
+    // Signal slaves whose awaited job is now available (targeted wakeup).
     // This eliminates the thundering herd problem.
     // Use ">= 0" (at-or-past) rather than strict "==" so a slave that fell behind
     // or hadn't yet parked in pthread_cond_timedwait() is still woken. The wait
     // predicate re-checks under filter_mutex, so an extra signal is a harmless no-op.
+#if FILTER_TARGETED_WAKEUP
     int targeted_count = 0;
     for (struct filter_out *slave = f->slave_list_head; slave != NULL; slave = slave->next_slave) {
       if ((int)(jobnum - slave->next_jobnum) >= 0) {
@@ -707,6 +769,12 @@ int execute_filter_input(struct filter_in * const f){
       }
     }
     f->targeted_signals += targeted_count;
+#else
+    // Broadcast: wake every slave on this master. Each re-checks its own predicate under
+    // filter_mutex, so extra wakeups are harmless and no wakeup can be lost.
+    pthread_cond_broadcast(&f->filter_cond);
+    f->broadcast_signals++;
+#endif
 
     pthread_mutex_unlock(&f->filter_mutex);
     return 0;
@@ -811,66 +879,105 @@ int execute_filter_output(struct filter_out * const slave,int const shift){
 
   // Wait for new block of output data
   pthread_mutex_lock(&master->filter_mutex);
-  int blocks_behind = master->completed_jobs[slave->next_jobnum % ND] - slave->next_jobnum;
-  if(blocks_behind >= ND){
-    // We've fallen too far behind. skip ahead to the oldest block still available
-    unsigned nextblock = master->completed_jobs[0];
-    for(int i=1; i < ND; i++){
-      if((int)(master->completed_jobs[i] - nextblock) < 0) // modular comparison
-	nextblock = master->completed_jobs[i];
-    }
-    slave->block_drops += nextblock - slave->next_jobnum;
-    slave->next_jobnum = nextblock;
-  }
-  // Wait on this slave's private condition variable (per-slave to avoid the thundering herd).
-  // The targeted wakeup in the FFT completion path signals every slave whose awaited job is
-  // now available (jobnum - next_jobnum >= 0), so in normal operation the signal arrives within
-  // one blocktime (~20 ms) and the timeout branch below never runs.
-  //
-  // The wait is still bounded (1 s) as a safety net against two rare states:
-  //   1. The predicate is already satisfied but a wakeup was somehow missed. The periodic
-  //      re-check simply falls out of the loop and resumes.
-  //   2. next_jobnum is >1 ahead of the newest completed job (only possible if the master's
-  //      job counter was rebased), so no wakeup can ever fire — resync instead of deadlocking.
-  // If the timeout ever fires we record it (rate-limited) so a recurrence is diagnosable
-  // without flooding the log.
-  while((int)(slave->next_jobnum - master->completed_jobs[slave->next_jobnum % ND]) > 0){
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME,&deadline); // slave_cond uses the default clock (NULL attrs)
-    deadline.tv_sec += 1;
-    if(pthread_cond_timedwait(&slave->slave_cond,&master->filter_mutex,&deadline) == ETIMEDOUT){
-      // Find the newest completed job across the ring
-      unsigned newest = master->completed_jobs[0];
-      for(int i = 1; i < ND; i++)
- if((int)(master->completed_jobs[i] - newest) > 0)
-   newest = master->completed_jobs[i];
 
-      // A timeout means a wakeup was missed or the front end stalled: this is the path that
-      // used to cause the ~1 s "slow waits" stalls. Count every occurrence, but rate-limit the
-      // detail line to at most once per 10 s per slave so a widespread stall can't flood stderr.
+  // Compute newest completed job by scanning the whole ring — this is the single source of
+  // truth. Modular (int)(a-b) comparison is required because completed_jobs[] are initialised
+  // to (unsigned)-1 at create_filter_input() so that startup never triggers a false drop.
+  unsigned newest = master->completed_jobs[0];
+  for(int i = 1; i < ND; i++)
+    if((int)(master->completed_jobs[i] - newest) > 0)
+      newest = master->completed_jobs[i];
+
+  // Hard-resync if we're >= ND blocks behind newest: our target slot was already overwritten.
+  // Skip to the oldest block still guaranteed present (newest-(ND-1)) and count the skipped
+  // blocks as real drops. This is the self-healing path the old code could not reach because
+  // it indexed completed_jobs[next_jobnum % ND] — the very slot that was overwritten — instead
+  // of scanning for newest.
+  if((int)(newest - slave->next_jobnum) >= ND){
+    unsigned const resync_to = newest - (ND - 1);
+    unsigned const skipped   = resync_to - slave->next_jobnum;
+    slave->block_drops += skipped;
+    slave->resync_events++;
+    // Tier 1: one-shot log per slave, ever — cannot flood even if all channels trip at once.
+    if(!slave->first_resync_logged){
+      slave->first_resync_logged = true;
+      fprintf(stderr,
+        "filter slave FIRST resync: slave=%p next_jobnum=%u newest=%u skipped=%u ND=%d gps=%lld"
+        " — consumer stalled >%d blocks; audio gap counted in block_drops\n",
+        (void*)slave, slave->next_jobnum, newest, skipped, ND,
+        (long long)gps_time_ns(), ND);
+    }
+    slave->next_jobnum = resync_to;
+  }
+
+  // Wait for our block to become available.
+  // FILTER_TARGETED_WAKEUP == 0 (default): wait on the master's shared filter_cond, which the
+  //   completion path broadcasts every block. This is self-healing: a mistimed/lost signal is
+  //   harmless because the next block re-broadcasts and we re-check the predicate below.
+  // FILTER_TARGETED_WAKEUP == 1: wait on this slave's private slave_cond (thundering-herd
+  //   optimization). A signal delivered while we're NOT parked here is lost, so we can sit out
+  //   the full 1 s timeout -> "behind_by 49".
+  //
+  // The wait is bounded (1 s) as a safety net for a missed wakeup or a stalled front end.
+  // newest is refreshed under the lock on every wakeup so we always compare against current data.
+  // If the timeout fires we record it (rate-limited) so a recurrence is diagnosable without
+  // flooding the log.
+  while((int)(slave->next_jobnum - newest) > 0){
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME,&deadline); // both condvars use the default clock (NULL attrs)
+    deadline.tv_sec += 1;
+#if FILTER_TARGETED_WAKEUP
+    int const wait_rc = pthread_cond_timedwait(&slave->slave_cond,&master->filter_mutex,&deadline);
+#else
+    int const wait_rc = pthread_cond_timedwait(&master->filter_cond,&master->filter_mutex,&deadline);
+#endif
+
+    // Refresh newest under the lock after every wakeup (spurious or real) so the predicate
+    // always reflects the current master state. Both completion paths (inline filter.c:694 and
+    // worker filter.c:621) set completed_jobs[] and signal while holding filter_mutex, so this
+    // read is race-free.
+    newest = master->completed_jobs[0];
+    for(int i = 1; i < ND; i++)
+      if((int)(master->completed_jobs[i] - newest) > 0)
+        newest = master->completed_jobs[i];
+
+    if(wait_rc == ETIMEDOUT){
+      // Count every timeout; rate-limit the detail line to once per 10 s per slave.
       slave->wait_timeouts++;
       int64_t const nowd = gps_time_ns();
       if(nowd >= slave->last_timeout_log_ns + 10 * BILLION){
- slave->last_timeout_log_ns = nowd;
- fprintf(stderr,"filter slave slow wait timeout: next_jobnum %u, master newest %u, behind_by %d, total_timeouts %lu, drops %u\n",
-  slave->next_jobnum,newest,(int)(newest - slave->next_jobnum),
-  slave->wait_timeouts,slave->block_drops);
+        slave->last_timeout_log_ns = nowd;
+        fprintf(stderr,
+          "filter slave wait timeout: next_jobnum %u, master newest %u, behind_by %d,"
+          " total_timeouts %lu, drops %u\n",
+          slave->next_jobnum, newest, (int)(newest - slave->next_jobnum),
+          slave->wait_timeouts, slave->block_drops);
       }
-
-      // Ahead-by-1 is the normal waiting state (even with a stalled front end) — keep waiting.
-      // Ahead-by-2+ means the master's job counter went backwards; resync to recover.
-      if((int)(slave->next_jobnum - newest) > 1){
- fprintf(stderr,"filter slave slow wait desync: next_jobnum %u, master newest %u - resyncing\n",
-  slave->next_jobnum,newest);
- slave->block_drops++;
- slave->next_jobnum = newest; // predicate now <= 0; resync below advances to newest+1
+      // If a timeout leaves us >= ND behind (master raced ahead while we were blocked),
+      // hard-resync again rather than spinning on an overwritten slot.
+      if((int)(newest - slave->next_jobnum) >= ND){
+        unsigned const resync_to = newest - (ND - 1);
+        unsigned const skipped   = resync_to - slave->next_jobnum;
+        slave->block_drops += skipped;
+        slave->resync_events++;
+        if(!slave->first_resync_logged){
+          slave->first_resync_logged = true;
+          fprintf(stderr,
+            "filter slave FIRST resync (in timeout): slave=%p next_jobnum=%u newest=%u"
+            " skipped=%u ND=%d gps=%lld — consumer stalled >%d blocks\n",
+            (void*)slave, slave->next_jobnum, newest, skipped, ND,
+            (long long)gps_time_ns(), ND);
+        }
+        slave->next_jobnum = resync_to;
       }
     }
   }
+  // Invariant on exit: our block is available and within the freshest ND window, so the
+  // post-return reads at radio.c estimate_noise and spectrum.c are valid.
+  assert((int)(newest - slave->next_jobnum) < ND);
   // We don't modify the master's output data, we create our own
   float complex const * const fdomain = master->fdomain[slave->next_jobnum % ND];
-  // in case we just waited so long that the buffer wrapped, resynch
-  slave->next_jobnum = master->completed_jobs[slave->next_jobnum % ND] + 1;
+  slave->next_jobnum++;   // advance by exactly one; never read a stale completed_jobs[] slot
   pthread_mutex_unlock(&master->filter_mutex);
 
   assert(fdomain != NULL); // Should always be master frequency data
